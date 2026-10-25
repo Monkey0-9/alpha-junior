@@ -49,7 +49,7 @@ ext_modules = [
         include_dirs=[pybind11.get_include()],
         language="c++",
         extra_compile_args=common_args,
-        extra_link_args=["-static-libgcc", "-static-libstdc++"],
+        extra_link_args=link_args,
     ),
     Extension(
         "nexus_backtester",
@@ -57,7 +57,7 @@ ext_modules = [
         include_dirs=[pybind11.get_include()],
         language="c++",
         extra_compile_args=common_args,
-        extra_link_args=["-static-libgcc", "-static-libstdc++"],
+        extra_link_args=link_args,
     ),
     Extension(
         "nexus_feed",
@@ -65,7 +65,7 @@ ext_modules = [
         include_dirs=[pybind11.get_include()],
         language="c++",
         extra_compile_args=common_args,
-        extra_link_args=["-static-libgcc", "-static-libstdc++"],
+        extra_link_args=link_args,
     ),
 ]
 
