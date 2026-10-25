@@ -15,11 +15,17 @@ jobs:
       uses: actions/setup-python@v4
       with:
         python-version: "3.11"
-    - name: Install dependencies
+    - name: Install public CI dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install -r requirements.lock.txt
-        pip install ruff mypy pytest
+        # requirements.lock.txt contains the private satellite_trade Git URL.
+        # Keep CI reproducible without requiring a developer token in GitHub Actions.
+        grep -v 'bloomb_mini.git' requirements.lock.txt > /tmp/requirements-ci.txt
+        pip install -r /tmp/requirements-ci.txt
+        pip install ruff mypy pytest pybind11
+    - name: Build C++ extensions
+      working-directory: nexus/cpp_extensions
+      run: python setup.py build_ext --inplace
     - name: Lint with ruff
       run: ruff check nexus
     - name: Type check with mypy
