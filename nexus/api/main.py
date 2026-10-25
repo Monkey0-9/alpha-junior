@@ -73,7 +73,10 @@ async def api_key_auth(
         "your_secure_api_key",
         "generate_a_secure_random_key_for_internal_auth",
     }
-    if not expected_key or expected_key.lower() in placeholder_keys:
+    if (
+        len(expected_key) < 32
+        or expected_key.lower() in placeholder_keys
+    ):
         return JSONResponse(
             status_code=503,
             content={"detail": "API authentication is not configured; set NEXUS_API_KEY."},
@@ -120,7 +123,7 @@ async def health() -> Dict[str, Any]:
         from pathlib import Path
         import sqlite3
 
-        db_path = Path("data/nexus_audit.db")
+        db_path = Path(__file__).resolve().parents[2] / "data" / "nexus_audit.db"
         if not db_path.exists():
             checks["database"] = "uninitialized"
             overall_status = "degraded"
