@@ -169,25 +169,21 @@ class AlphaEngine:
             df = df.rename(
                 columns={k: v for k, v in mapping.items() if k in df.columns}
             )
-        else:
+        elif Config.ALLOW_YAHOO_FALLBACK:
             try:
                 import yfinance as yf
 
                 yf_logger = logging.getLogger("yfinance")
                 old_yf_level = yf_logger.level
                 yf_logger.setLevel(logging.CRITICAL)
-                interval = (
-                    "1d"
-                    if timeframe == "1D"
-                    else "15m" if timeframe == "15Min" else "1m"
-                )
+                intervals = {"1D": "1d", "15Min": "15m", "1Min": "1m"}
+                interval = intervals.get(timeframe)
+                if interval is None:
+                    logger.warning("Unsupported fallback timeframe %s for %s", timeframe, symbol)
+                    return pd.DataFrame()
                 df = yf.download(symbol, period="7d", interval=interval, progress=False)
-                if getattr(df, "empty", True) and timeframe == "1Min":
-                    df = yf.download(
-                        symbol, period="7d", interval="15m", progress=False
-                    )
             except Exception as e:
-                logger.debug("yfinance fallback failed for %s: %s", symbol, e)
+                logger.warning("Opt-in Yahoo fallback failed for %s: %s", symbol, e)
                 return pd.DataFrame()
             finally:
                 try:
@@ -208,13 +204,27 @@ class AlphaEngine:
         for k, v in rename_map.items():
             if k in df.columns and v not in df.columns:
                 df[v] = df[k]
-        for col in ["open", "high", "low", "close", "volume"]:
-            if col not in df.columns:
-                df[col] = df["close"] if "close" in df.columns else 0.0
+        # Never fabricate missing OHLCV columns from close or zero: that can
+        # silently turn malformed/stale data into tradeable features.
+        df = df.loc[:, ~df.columns.duplicated()].copy()
+        required = ["open", "high", "low", "close", "volume"]
+        if any(col not in df.columns for col in required):
+            logger.warning("Rejecting malformed market data: missing required OHLCV columns.")
+            return pd.DataFrame(columns=required)
+        for col in required:
             col_data = df[col]
             if isinstance(col_data, pd.DataFrame):
-                df[col] = col_data.iloc[:, 0]
-        return df.loc[:, ~df.columns.duplicated()].tail(limit)
+                col_data = col_data.iloc[:, 0]
+            df[col] = pd.to_numeric(col_data, errors="coerce")
+        numeric = df[required].to_numpy(dtype=float)
+        valid_rows = np.isfinite(numeric).all(axis=1)
+        valid_rows &= (df["open"].to_numpy() > 0)
+        valid_rows &= (df["high"].to_numpy() > 0)
+        valid_rows &= (df["low"].to_numpy() > 0)
+        valid_rows &= (df["close"].to_numpy() > 0)
+        valid_rows &= (df["volume"].to_numpy() >= 0)
+        clean = df.loc[valid_rows]
+        return clean.tail(limit)
 
     def generate_signal(
         self,
