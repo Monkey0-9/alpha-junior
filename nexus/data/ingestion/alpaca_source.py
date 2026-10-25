@@ -1,5 +1,5 @@
 import pandas as pd
-from typing import List
+from typing import List, Optional, Any
 from datetime import datetime
 import logging
 from .base import DataSource
@@ -12,8 +12,11 @@ try:
     from alpaca.data.requests import CryptoBarsRequest, StockBarsRequest
     from alpaca.data.timeframe import TimeFrame
 except ImportError:
-    CryptoHistoricalDataClient = None
-    StockHistoricalDataClient = None
+    CryptoHistoricalDataClient = None  # type: ignore[assignment, misc]
+    StockHistoricalDataClient = None  # type: ignore[assignment, misc]
+    CryptoBarsRequest = None  # type: ignore[assignment, misc]
+    StockBarsRequest = None  # type: ignore[assignment, misc]
+    TimeFrame = None  # type: ignore[assignment, misc]
 
 logger = logging.getLogger(__name__)
 
@@ -24,12 +27,16 @@ class AlpacaSource(DataSource):
     """
 
     def __init__(
-        self, api_key: str = None, secret_key: str = None, is_crypto: bool = False
+        self,
+        api_key: Optional[str] = None,
+        secret_key: Optional[str] = None,
+        is_crypto: bool = False,
     ):
         if StockHistoricalDataClient is None:
             raise ImportError("alpaca-py is required to use AlpacaSource.")
 
         self.is_crypto = is_crypto
+        self.client: Any
         if is_crypto:
             self.client = CryptoHistoricalDataClient(api_key, secret_key)
         else:
@@ -69,20 +76,21 @@ class AlpacaSource(DataSource):
         }
 
         try:
+            bars: Any = None
             if self.is_crypto:
-                req = CryptoBarsRequest(**request_params)
-                bars = self.client.get_crypto_bars(req)
+                req_crypto = CryptoBarsRequest(**request_params)
+                bars = self.client.get_crypto_bars(req_crypto)
             else:
-                req = StockBarsRequest(**request_params)
-                bars = self.client.get_stock_bars(req)
+                req_stock = StockBarsRequest(**request_params)
+                bars = self.client.get_stock_bars(req_stock)
         except Exception as e:
             logger.error(f"Failed to fetch data from Alpaca: {e}")
             raise
 
-        if not bars or not bars.data:
+        if not bars or not getattr(bars, "data", None):
             return pd.DataFrame()
 
-        df = bars.df.reset_index()
+        df = getattr(bars, "df", pd.DataFrame()).reset_index()
 
         # Rename standard columns
         rename_map = {

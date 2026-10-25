@@ -1,6 +1,6 @@
 import pandas as pd
 import logging
-from typing import Tuple
+from typing import Tuple, List, Callable
 from .rules import (
     check_timestamp_monotonicity,
     check_duplicates,
@@ -16,8 +16,8 @@ class ValidationPipeline:
     Runs a batch of market data through all validation rules.
     """
 
-    def __init__(self):
-        self.rules = [
+    def __init__(self) -> None:
+        self.rules: List[Callable[[pd.DataFrame], Tuple[bool, pd.DataFrame]]] = [
             check_duplicates,
             check_timestamp_monotonicity,
             check_negative_prices,

@@ -84,7 +84,7 @@ class ParquetDataStore:
 
     def list_available_symbols(self) -> List[Dict[str, Any]]:
         """Lists all symbols stored in the Parquet data lake."""
-        symbols = []
+        symbols: List[Dict[str, Any]] = []
         if not os.path.exists(self.store_dir):
             return symbols
 

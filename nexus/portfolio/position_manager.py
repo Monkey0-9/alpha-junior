@@ -8,9 +8,9 @@ logger = logging.getLogger(__name__)
 
 
 class VolatilityRegimeAdapter:
-    def __init__(self, window: int = 21):
+    def __init__(self, window: int = 21) -> None:
         self.window = window
-        self._vol_history = []
+        self._vol_history: list[float] = []
 
     def update(self, returns: np.ndarray) -> str:
         if len(returns) < self.window:
@@ -30,11 +30,11 @@ class VolatilityRegimeAdapter:
 
 
 class PositionManager:
-    def __init__(self):
+    def __init__(self) -> None:
         self._watermarks: Dict[str, float] = {}
         self._entry_times: Dict[str, float] = {}
         self._vol_adapter = VolatilityRegimeAdapter()
-        self._return_buffer: Dict[str, list] = {}
+        self._return_buffer: Dict[str, list[float]] = {}
 
     def _get_atr(self, history: pd.DataFrame, period: int = 14) -> float:
         if history.empty or len(history) < period:

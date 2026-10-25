@@ -16,7 +16,7 @@ class DuckDBHelper:
         self.conn = duckdb.connect(database=self.db_path)
         self._register_lake()
 
-    def _register_lake(self):
+    def _register_lake(self) -> None:
         """
         Registers the data lake parquet files as a DuckDB view/table using Hive partitioning.
         """
@@ -42,6 +42,6 @@ class DuckDBHelper:
         """Execute a query and return a DuckDB connection/relation."""
         return self.conn.execute(sql)
 
-    def close(self):
+    def close(self) -> None:
         """Close the DuckDB connection."""
         self.conn.close()

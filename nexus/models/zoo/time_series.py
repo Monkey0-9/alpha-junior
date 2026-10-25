@@ -1,9 +1,13 @@
 import logging
 import numpy as np
 import pandas as pd
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Any
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.preprocessing import StandardScaler
+
+torch: Any = None
+nn: Any = None
+optim: Any = None
 
 try:
     import torch
@@ -13,9 +17,6 @@ try:
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
-    torch = None
-    nn = None
-    optim = None
 
 logger = logging.getLogger(__name__)
 
@@ -186,7 +187,7 @@ class PyTorchLSTMModel:
         self.epochs = epochs
         self.scaler = StandardScaler()
         self.tree_fallback = GradientBoostedTimeSeriesModel()
-        self.model = None
+        self.model: Any = None
         self.is_trained = False
 
     def _build_sequences(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
@@ -316,7 +317,7 @@ class TemporalTransformerModel:
         self.tree_fallback = GradientBoostedTimeSeriesModel()
         self.is_trained = False
         self.scaler = StandardScaler()
-        self.model = None
+        self.model: Any = None
 
     def fit(self, df: pd.DataFrame) -> bool:
         if not TORCH_AVAILABLE:
@@ -339,13 +340,13 @@ class TemporalTransformerModel:
             X_raw = self.scaler.fit_transform(df_clean[available_cols].to_numpy())
             y_raw = df_clean["target"].to_numpy()
 
-            X_seq, y_seq = [], []
+            X_seq_list, y_seq_list = [], []
             for i in range(len(X_raw) - self.sequence_length):
-                X_seq.append(X_raw[i : i + self.sequence_length])
-                y_seq.append(y_raw[i + self.sequence_length - 1])
+                X_seq_list.append(X_raw[i : i + self.sequence_length])
+                y_seq_list.append(y_raw[i + self.sequence_length - 1])
 
-            X_seq = np.array(X_seq, dtype=np.float32)
-            y_seq = np.array(y_seq, dtype=np.int64)
+            X_seq = np.array(X_seq_list, dtype=np.float32)
+            y_seq = np.array(y_seq_list, dtype=np.int64)
 
             in_dim = X_seq.shape[2]
 

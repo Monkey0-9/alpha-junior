@@ -538,10 +538,10 @@ class NexusEngine:
 
             # Record outcome for ensemble learning
             for pos in current_positions:
-                sym = pos.get("symbol")
+                pos_sym = str(pos.get("symbol", ""))
                 unrealized_pl_pc = pos.get("unrealized_plpc", 0.0)
-                if sym in raw_signals and len(self.ensemble_brain.models) > 0:
-                    sig = 1 if raw_signals[sym] > 0 else -1
+                if pos_sym and pos_sym in raw_signals and len(self.ensemble_brain.models) > 0:
+                    sig = 1 if raw_signals[pos_sym] > 0 else -1
                     self.ensemble_brain.record_outcome(
                         model_name=self.ensemble_brain.models[0]["name"],
                         predicted_signal=sig,

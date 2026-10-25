@@ -26,7 +26,7 @@ class WalkForwardEvaluator:
 
     def generate_splits(self, df: pd.DataFrame) -> List[Dict[str, pd.DataFrame]]:
         """Splits time series into rolling train, validation, and test windows."""
-        splits = []
+        splits: List[Dict[str, pd.DataFrame]] = []
         n_samples = len(df)
         min_required = self.train_window + self.val_window + self.test_window
 
