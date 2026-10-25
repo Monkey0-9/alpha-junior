@@ -9,6 +9,7 @@ Replaces flat normalized weights with:
 """
 
 import logging
+import math
 import numpy as np
 import pandas as pd
 from typing import Dict, Any, List, Optional, Tuple
@@ -45,7 +46,9 @@ class KellyCriterionSizer:
     """
 
     def __init__(self, fraction: float = 0.25):
-        self.fraction = fraction  # conservative fractional Kelly
+        if not math.isfinite(fraction):
+            fraction = 0.0
+        self.fraction = float(np.clip(fraction, 0.0, 1.0))
 
     def size_position(
         self,
@@ -66,11 +69,16 @@ class KellyCriterionSizer:
         -------
         float   Kelly fraction of capital to allocate (0–1, clipped)
         """
-        if avg_loss <= 0 or avg_win <= 0:
-            return 0.02  # minimum allocation
+        if (
+            not all(math.isfinite(v) for v in (win_rate, avg_win, avg_loss))
+            or avg_loss <= 0
+            or avg_win <= 0
+        ):
+            # Unknown/invalid payoff data is not a reason to allocate capital.
+            return 0.0
 
         b = avg_win / avg_loss  # win/loss ratio
-        p = max(0.01, min(0.99, win_rate))
+        p = max(0.0, min(1.0, win_rate))
         q = 1.0 - p
 
         kelly_f = (p * b - q) / b
@@ -161,10 +169,18 @@ class PortfolioOptimizer:
         -------
         dict[symbol → weight]   Portfolio weights (sum ≤ 1.0)
         """
-        if not symbols:
+        if not symbols or len(symbols) != len(signals):
+            return {}
+        if len(set(symbols)) != len(symbols) or any(
+            not isinstance(symbol, str) or not symbol.strip() for symbol in symbols
+        ):
             return {}
 
-        signals_arr = np.array(signals, dtype=float)
+        signals_arr = np.asarray(signals, dtype=float)
+        if signals_arr.ndim != 1 or not np.isfinite(signals_arr).all():
+            # Invalid signal values can never silently become portfolio weights.
+            return {}
+        signals_arr = np.clip(signals_arr, -1.0, 1.0)
 
         # Step 1: IC scaling — amplify high-IC signals, dampen low-IC
         ic_scales = np.array(
