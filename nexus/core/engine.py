@@ -300,11 +300,20 @@ class NexusEngine:
     def build_portfolio_state(
         self, account: Dict[str, Any], positions: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
-        total_value = float(account.get("equity", self.portfolio_value))
-        last_equity = float(account.get("last_equity", total_value))
-        if np.isnan(total_value) or total_value <= 0:
-            total_value = self.portfolio_value
-        drawdown = max(0.0, (last_equity - total_value) / max(total_value, 1.0))
+        equity_raw = account.get("equity", account.get("portfolio_value"))
+        last_equity_raw = account.get("last_equity", equity_raw)
+        if equity_raw is None or last_equity_raw is None:
+            raise ValueError("Cannot build portfolio state without verified equity values.")
+        total_value = float(equity_raw)
+        last_equity = float(last_equity_raw)
+        if (
+            not np.isfinite(total_value)
+            or total_value <= 0
+            or not np.isfinite(last_equity)
+            or last_equity <= 0
+        ):
+            raise ValueError("Cannot build portfolio state from invalid equity values.")
+        drawdown = max(0.0, (last_equity - total_value) / last_equity)
         return {
             "total_value": total_value,
             "drawdown": drawdown,
@@ -361,9 +370,20 @@ class NexusEngine:
         except Exception:
             clock_data = {"is_open": False}
 
-        account = await self.get_account_state()
-        current_positions = await self.get_positions()
-        holdings = {p["symbol"]: p for p in current_positions}
+        try:
+            account = await self.get_account_state()
+            current_positions = await self.get_positions()
+        except Exception as exc:
+            logger.critical(
+                "Broker account/positions are not verified; halting this trading cycle before any new orders: %s",
+                exc,
+            )
+            self.health_monitor.record(
+                "broker", False, details="Account/position state unknown; cycle aborted"
+            )
+            self.health_monitor.heartbeat()
+            return
+        holdings = {str(p["symbol"]).upper(): p for p in current_positions}
 
         for symbol in list(self.position_ages):
             if symbol not in holdings:
