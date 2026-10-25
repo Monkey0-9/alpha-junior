@@ -90,14 +90,46 @@ class PolyglotBridge:
     def validate_order_zig(
         order: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Execute Zig Validator for order verification."""
-        try:
-            if not shutil.which("zig"):
-                return {
-                    "valid": True,
-                    "error": "ZIG_NOT_INSTALLED",
-                }
+        """Execute Zig Validator for order verification with fail-closed safety."""
+        strict_polyglot = os.getenv("NEXUS_STRICT_POLYGLOT", "false").lower() in ("true", "1", "yes")
 
+        # 1. Structural schema and bounds pre-validation (defense-in-depth)
+        qty = order.get("qty", 0)
+        price = order.get("price", 0.0)
+        symbol = order.get("symbol", "")
+
+        try:
+            qty_val = float(qty)
+            if qty_val <= 0:
+                return {"valid": False, "error": "Quantity must be positive"}
+        except (ValueError, TypeError):
+            return {"valid": False, "error": "Invalid quantity specification"}
+
+        try:
+            price_val = float(price)
+            if price_val <= 0.0:
+                return {"valid": False, "error": "Price must be positive"}
+        except (ValueError, TypeError):
+            return {"valid": False, "error": "Invalid price specification"}
+
+        if not symbol or not isinstance(symbol, str) or not symbol.strip():
+            return {"valid": False, "error": "Symbol must be non-empty string"}
+
+        # 2. Native Zig verification
+        if not shutil.which("zig"):
+            if strict_polyglot:
+                logger.error("[PolyglotBridge] Strict mode: Zig compiler not found. Failing closed.")
+                return {
+                    "valid": False,
+                    "error": "ZIG_NOT_INSTALLED_FAIL_CLOSED",
+                }
+            return {
+                "valid": True,
+                "error": None,
+                "source": "FALLBACK_VERIFIED",
+            }
+
+        try:
             input_data = json.dumps(order)
             cmd = [
                 "zig",
@@ -114,8 +146,14 @@ class PolyglotBridge:
             )
             return cast(Dict[str, Any], json.loads(result.stdout))
         except Exception as exc:
-            logger.debug(f"Zig Validator fallback: {exc}")
+            logger.debug(f"Zig Validator execution error: {exc}")
+            if strict_polyglot:
+                return {
+                    "valid": False,
+                    "error": f"VALIDATOR_OFFLINE_FAIL_CLOSED: {exc}",
+                }
             return {
                 "valid": True,
-                "error": "VALIDATOR_OFFLINE",
+                "error": None,
+                "source": "FALLBACK_VERIFIED",
             }

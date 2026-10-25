@@ -1,10 +1,10 @@
 import subprocess
 import time
-import os
 import sys
 import logging
 import signal
 import threading
+from typing import Optional, Any, Dict, TextIO, cast
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -25,26 +25,27 @@ logger = logging.getLogger("Nexus24x7")
 class Nexus24x7Manager:
     """Manages Nexus platform for 24/7 continuous operation with real-time visibility."""
 
-    def __init__(self):
-        self.running = False
-        self.orchestrator_process = None
-        self.start_time = None
-        self.restart_count = 0
-        self.total_runtime = timedelta()
-        self.root = os.getcwd()
-        self.log_thread = None
+    def __init__(self) -> None:
+        self.running: bool = False
+        self.orchestrator_process: Optional[subprocess.Popen[str]] = None
+        self.start_time: Optional[datetime] = None
+        self.restart_count: int = 0
+        self.total_runtime: timedelta = timedelta()
+        self.root: str = str(Path(__file__).resolve().parent)
+        self.log_thread: Optional[threading.Thread] = None
+        self._orchestrator_log: Optional[TextIO] = None
 
         # Signal handlers
         signal.signal(signal.SIGINT, self._handle_shutdown)
         signal.signal(signal.SIGTERM, self._handle_shutdown)
 
-    def _handle_shutdown(self, signum, frame):
+    def _handle_shutdown(self, signum: int, frame: Any) -> None:
         """Handle graceful shutdown."""
         logger.info("[SHUTDOWN] Signal received. Terminating all processes...")
         self.shutdown()
         sys.exit(0)
 
-    def _stream_logs(self, pipe, log_file_handle):
+    def _stream_logs(self, pipe: Any, log_file_handle: TextIO) -> None:
         """Streams logs from the subprocess to terminal and file."""
         try:
             for line in iter(pipe.readline, ""):
@@ -61,10 +62,10 @@ class Nexus24x7Manager:
         finally:
             pipe.close()
 
-    def start(self):
+    def start(self) -> bool:
         """Start the Nexus platform with real-time log streaming."""
         if self.running:
-            return
+            return True
 
         logger.info("=" * 80)
         logger.info(
@@ -113,7 +114,7 @@ class Nexus24x7Manager:
 
         return True
 
-    def monitor(self):
+    def monitor(self) -> bool:
         """Monitor the running platform."""
         if not self.running or not self.orchestrator_process:
             return False
@@ -128,7 +129,7 @@ class Nexus24x7Manager:
 
         return True
 
-    def get_runtime_stats(self):
+    def get_runtime_stats(self) -> Dict[str, Any]:
         """Get runtime statistics."""
         if self.start_time:
             current_runtime = datetime.now() - self.start_time
@@ -137,9 +138,9 @@ class Nexus24x7Manager:
                 "restarts": self.restart_count,
                 "timestamp": datetime.now().strftime("%H:%M:%S"),
             }
-        return {}
+        return cast(Dict[str, Any], {})
 
-    def log_status(self):
+    def log_status(self) -> None:
         """Log current system status with high visibility."""
         stats = self.get_runtime_stats()
         logger.info(
@@ -148,7 +149,7 @@ class Nexus24x7Manager:
             f"Status: ACTIVE 24/7"
         )
 
-    def shutdown(self):
+    def shutdown(self) -> None:
         """Shutdown the platform gracefully."""
         if not self.running:
             return
@@ -170,7 +171,7 @@ class Nexus24x7Manager:
 
         self.running = False
 
-    def run_24_7(self):
+    def run_24_7(self) -> None:
         """Main 24/7 operation loop with real-time monitoring."""
         logger.info("[GUARD] Nexus 24/7 Sentinel Started")
 

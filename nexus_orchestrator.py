@@ -47,7 +47,7 @@ class NexusOrchestrator:
         self.processes.append(
             {"name": name, "cmd": cmd, "cwd": cwd, "env": env, "proc": p}
         )
-        self.restart_attempts[name] = 0
+        self.restart_attempts.setdefault(name, 0)
 
     def stop_process(self, process: Dict[str, Any]) -> None:
         p = process["proc"]
@@ -135,7 +135,7 @@ class NexusOrchestrator:
             "--browser.gatherUsageStats",
             "false",
             "--server.address",
-            "127.0.0.1",
+            Config.API_HOST,
         ]
         self.start_process(
             "Terminal-UI",

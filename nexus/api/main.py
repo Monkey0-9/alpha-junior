@@ -100,8 +100,57 @@ app.add_middleware(
 
 
 @app.get("/api/health")
-async def health() -> Dict[str, str]:
-    return {"status": "healthy", "service": "Nexus API", "version": "2.0.0"}
+async def health() -> Dict[str, Any]:
+    checks: Dict[str, Any] = {
+        "api": "healthy",
+        "database": "unknown",
+        "broker": "unknown",
+    }
+    overall_status = "healthy"
+
+    # 1. Database check
+    try:
+        from pathlib import Path
+        import sqlite3
+
+        db_path = Path("data/nexus_audit.db")
+        if not db_path.exists():
+            checks["database"] = "uninitialized"
+            overall_status = "degraded"
+        else:
+            conn = sqlite3.connect(str(db_path), timeout=2)
+            conn.execute("SELECT 1 FROM audit_log LIMIT 1")
+            conn.close()
+            checks["database"] = "healthy"
+    except Exception as exc:
+        checks["database"] = f"error: {str(exc)}"
+        overall_status = "degraded"
+
+    # 2. Broker connection check
+    try:
+        client = get_client()
+        if not client.enabled:
+            checks["broker"] = "disabled"
+            overall_status = "degraded"
+        elif client.simulated:
+            checks["broker"] = "simulated"
+        else:
+            acc = await client.get_account()
+            if acc.get("status") in {"ACTIVE", "healthy"}:
+                checks["broker"] = "connected"
+            else:
+                checks["broker"] = acc.get("status", "error")
+                overall_status = "degraded"
+    except Exception as exc:
+        checks["broker"] = f"error: {str(exc)}"
+        overall_status = "degraded"
+
+    return {
+        "status": overall_status,
+        "service": "Nexus Institutional API",
+        "version": "2.0.0",
+        "checks": checks,
+    }
 
 
 app.include_router(alpaca_router)

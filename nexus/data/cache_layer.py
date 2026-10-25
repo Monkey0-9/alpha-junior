@@ -15,9 +15,10 @@ class MarketDataCache:
     Prevents duplicate REST calls to Alpaca and eliminates 429 Rate Limits.
     """
 
-    _instance = None
+    _instance: Optional["MarketDataCache"] = None
+    _initialized: bool = False
 
-    def __new__(cls, db_path: str = DB_PATH):
+    def __new__(cls, db_path: str = DB_PATH) -> "MarketDataCache":
         if cls._instance is None:
             cls._instance = super(MarketDataCache, cls).__new__(cls)
             cls._instance._initialized = False

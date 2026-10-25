@@ -1,6 +1,6 @@
 [project]
 name = "nexus-quant"
-version = "1.0.0"
+version = "2.0.0"
 description = "Institutional-grade quantitative trading platform"
 authors = [
     {name = "Institutional Quant Team"}
@@ -40,9 +40,9 @@ executionEnvironments = [
   { root = "." }
 ]
 
-[tool.setuptools]
-package-dir = {"" = "."}
-packages = ["nexus"]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["nexus*"]
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]

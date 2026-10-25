@@ -195,18 +195,64 @@ class PortfolioOptimizer:
                 kelly_weights, historical_data
             )
 
-        # Step 4: Normalize, cap, floor
-        total = sum(kelly_weights.values()) + 1e-9
-        weights: Dict[str, float] = {}
-        for sym, w in kelly_weights.items():
-            normalized = w / total
-            normalized = min(normalized, self.MAX_POSITION)
-            if normalized >= self.MIN_POSITION:
-                weights[sym] = float(normalized)
+        # Step 4: Strict bounded constraint enforcement (water-filling)
+        return self._enforce_bounded_weights(kelly_weights)
 
-        # Re-normalize after capping
-        final_total = sum(weights.values()) + 1e-9
-        return {s: w / final_total for s, w in weights.items()}
+    def _enforce_bounded_weights(
+        self, raw_weights: Dict[str, float]
+    ) -> Dict[str, float]:
+        """
+        Guarantees that:
+          1. No asset exceeds self.MAX_POSITION (strict upper bound).
+          2. No asset below self.MIN_POSITION is allocated.
+          3. Total allocated weight sum <= 1.0 (remainder is cash buffer).
+        """
+        eligible = {k: float(v) for k, v in raw_weights.items() if v >= 1e-6}
+        if not eligible:
+            return {}
+
+        total = sum(eligible.values())
+        if total <= 1e-9:
+            return {}
+
+        # Initial relative sizing
+        weights = {k: v / total for k, v in eligible.items()}
+
+        # Iterative Water-Filling capping:
+        # Capping an asset at MAX_POSITION fixes it; any remaining budget is distributed
+        # only to assets that have not yet hit MAX_POSITION.
+        for _ in range(10):
+            excess = 0.0
+            unconstrained_sum = 0.0
+            needs_adjustment = False
+
+            for sym, w in list(weights.items()):
+                if w > self.MAX_POSITION + 1e-9:
+                    excess += w - self.MAX_POSITION
+                    weights[sym] = self.MAX_POSITION
+                    needs_adjustment = True
+                elif w < self.MAX_POSITION:
+                    unconstrained_sum += w
+
+            if not needs_adjustment or unconstrained_sum <= 1e-9:
+                break
+
+            redistribution_factor = (unconstrained_sum + excess) / unconstrained_sum
+            for sym, w in weights.items():
+                if w < self.MAX_POSITION:
+                    weights[sym] = min(self.MAX_POSITION, w * redistribution_factor)
+
+        # Apply minimum threshold floor
+        filtered = {k: w for k, w in weights.items() if w >= self.MIN_POSITION}
+
+        # Final safety enforcement: guarantee w <= MAX_POSITION and sum <= 1.0
+        final_weights: Dict[str, float] = {}
+        total_w = sum(filtered.values())
+        scale = 1.0 if total_w <= 1.0 else (1.0 / total_w)
+        for k, w in filtered.items():
+            final_weights[k] = min(self.MAX_POSITION, round(float(w * scale), 6))
+
+        return final_weights
 
     def _apply_correlation_penalty(
         self,
@@ -424,8 +470,10 @@ class MonteCarloSimulator:
                 sys.path.append(cpp_dir)
             import nexus_cpp
 
-            return nexus_cpp.run_survival_analysis(
-                initial_capital, mu, sigma, days, n_simulations, ruin_threshold
+            return float(
+                nexus_cpp.run_survival_analysis(
+                    initial_capital, mu, sigma, days, n_simulations, ruin_threshold
+                )
             )
         except ImportError as e:
             logger.warning(

@@ -21,6 +21,7 @@ from nexus.utils.platform_logging import setup_logging
 from nexus.utils.polyglot_bridge import PolyglotBridge
 from nexus.portfolio.position_manager import PositionManager
 from nexus.learning.trainer import ContinuousLearner
+from nexus.universe import UniverseManager
 
 logger = logging.getLogger(__name__)
 
@@ -48,8 +49,11 @@ class NexusEngine:
         self.neural_ode = NeuralODE()
         self.lattice_voter = LatticeVoter()
         self.strategy_switcher = StrategySwitcher()
+        self.universe_manager = UniverseManager()
 
-        self.symbols: List[str] = []
+        self.symbols: List[str] = self.universe_manager.get_fallback_universe(
+            limit=Config.CANDIDATE_POOL_SIZE
+        )
         self.market_regime = "SIDEWAYS"
         self.portfolio_value = Config.FALLBACK_EQUITY
         self.max_positions = Config.MAX_OPEN_POSITIONS
@@ -67,6 +71,64 @@ class NexusEngine:
         self._conviction_cache: Dict[str, Any] = {}
         self.position_manager = PositionManager()
         self.learner = ContinuousLearner()
+        self._init_ensemble_brain()
+
+    def _init_ensemble_brain(self) -> None:
+        """Register active institutional models into AIEnsembleBrain."""
+        try:
+            from nexus.models.zoo.time_series import (
+                GradientBoostedTimeSeriesModel,
+                PyTorchLSTMModel,
+                TORCH_AVAILABLE,
+            )
+
+            # 1. Gradient Boosted Decision Tree
+            self.ensemble_brain.add_model(
+                GradientBoostedTimeSeriesModel(confidence_threshold=0.52),
+                name="GradientBoostedTree",
+                weight=1.0,
+            )
+
+            # 2. PyTorch LSTM Deep Model
+            if TORCH_AVAILABLE:
+                try:
+                    self.ensemble_brain.add_model(
+                        PyTorchLSTMModel(sequence_length=10, epochs=2),
+                        name="PyTorchLSTM",
+                        weight=0.9,
+                    )
+                except Exception as exc:
+                    logger.debug("PyTorchLSTM init skipped: %s", exc)
+
+            # 3. Trend Acceleration / Neural ODE Adapter
+            class TrendAccelerationAdapter:
+                def __init__(self, ode_model: Any):
+                    self.ode_model = ode_model
+
+                def predict(self, df: pd.DataFrame) -> float:
+                    if df.empty or "close" not in df.columns or len(df) < 5:
+                        return 0.0
+                    drift = self.ode_model.predict_trajectory(df["close"].to_numpy())
+                    return float(np.tanh(drift))
+
+                def predict_proba(self, df: pd.DataFrame) -> Dict[int, float]:
+                    sig = self.predict(df)
+                    p_buy = max(0.0, sig)
+                    p_sell = max(0.0, -sig)
+                    p_hold = max(0.0, 1.0 - p_buy - p_sell)
+                    return {1: p_buy, -1: p_sell, 0: p_hold}
+
+            self.ensemble_brain.add_model(
+                TrendAccelerationAdapter(self.neural_ode),
+                name="TrendAccelerationODE",
+                weight=0.8,
+            )
+            logger.info(
+                "AIEnsembleBrain initialized with %d active models.",
+                len(self.ensemble_brain.models),
+            )
+        except Exception as exc:
+            logger.error("Failed to initialize AIEnsembleBrain models: %s", exc)
 
     async def _get_client(self) -> httpx.AsyncClient:
         """Returns the shared AsyncClient for connection pooling."""
@@ -123,7 +185,7 @@ class NexusEngine:
         return True
 
     async def refresh_universe(self) -> None:
-        """Dynamic universe re-scanner."""
+        """Dynamic universe re-scanner utilizing UniverseManager."""
         logger.info("Refreshing tradable universe assets...")
         client = await self._get_client()
         try:
@@ -139,73 +201,32 @@ class NexusEngine:
             if response.status_code == 200:
                 asset_data = response.json()
                 assets = asset_data.get("assets", [])
-                candidate_assets = []
-                for asset in assets:
-                    symbol = asset.get("symbol")
-                    exchange = str(asset.get("exchange", "")).upper()
-                    if not asset.get("tradable", False):
-                        continue
-                    if not symbol or not self._is_valid_symbol(symbol):
-                        continue
-                    if not self._is_preferred_exchange(exchange):
-                        continue
-                    candidate_assets.append(symbol)
-
-                if Config.TRADE_ALL_ASSETS:
-                    self.symbols = candidate_assets[: Config.MAX_UNIVERSE_ASSETS]
-                else:
-                    max_symbols = min(Config.CANDIDATE_POOL_SIZE, 30)
-                    if Config.CANDIDATE_POOL_SIZE > 30:
-                        logger.warning(
-                            "Candidate pool size %s is too large for Alpaca data limits; reducing to %s for execution.",
-                            Config.CANDIDATE_POOL_SIZE,
-                            max_symbols,
-                        )
-                    self.symbols = candidate_assets[:max_symbols]
-
-                if not self.symbols:
-                    self.symbols = [
-                        "TSLA",
-                        "PLTR",
-                        "MSTR",
-                        "COIN",
-                        "NVDA",
-                        "TQQQ",
-                        "SOXL",
-                        "SPY",
-                    ]
-                logger.info(
-                    f"Loaded universe with {len(self.symbols)} symbols "
-                    f"from {len(candidate_assets)} tradable Alpaca assets."
+                target_size = (
+                    Config.MAX_UNIVERSE_ASSETS
+                    if Config.TRADE_ALL_ASSETS
+                    else min(Config.CANDIDATE_POOL_SIZE, 30)
+                )
+                self.symbols = self.universe_manager.select_universe(
+                    assets, max_symbols=target_size
                 )
                 self.last_universe_refresh = time.time()
+                logger.info(
+                    f"Universe refreshed: {len(self.symbols)} qualified assets active."
+                )
             else:
                 raise ValueError(f"Asset scan returned {response.status_code}")
         except Exception as exc:
             logger.warning(f"Asset universe fallback: {exc}")
-            self.symbols = [
-                "TSLA",
-                "PLTR",
-                "MSTR",
-                "COIN",
-                "NVDA",
-                "TQQQ",
-                "SOXL",
-                "SPY",
-                "AAPL",
-                "MSFT",
-            ]
+            target_size = min(Config.CANDIDATE_POOL_SIZE, 30)
+            self.symbols = self.universe_manager.get_fallback_universe(limit=target_size)
+            self.universe_manager.record_snapshot(self.symbols)
+            self.last_universe_refresh = time.time()
 
     def _is_preferred_exchange(self, exchange: str) -> bool:
-        preferred = {"NASDAQ", "NYSE", "ARCA", "AMEX", "NYSEARCA", "NYSEAMEX"}
-        return exchange in preferred
+        return self.universe_manager.is_preferred_exchange(exchange)
 
     def _is_valid_symbol(self, symbol: str) -> bool:
-        if "." in symbol or "-" in symbol or "$" in symbol:
-            return False
-        if len(symbol) < 1 or len(symbol) > 4:
-            return False
-        return symbol.isalnum()
+        return self.universe_manager.is_valid_symbol(symbol)
 
     async def get_account_state(self) -> Dict[str, Any]:
         client = await self._get_client()
@@ -396,13 +417,16 @@ class NexusEngine:
                 regime_probabilities=regime_probs,
             )
 
-            if ai_signal == 0:
+            if not self.ensemble_brain.models:
+                # Direct pass-through if ensemble brain has no registered models
+                enhanced_signals[sym] = float(np.clip(raw, -1.0, 1.0))
+            elif ai_signal == 0:
                 logger.debug(f"[AIEnsembleBrain] Gated out {sym} (NO_TRADE confidence)")
                 continue
-
-            # Blend Raw Alpha with Ensemble AI decision
-            blended = (ai_signal * 0.7) + (raw * 0.3)
-            enhanced_signals[sym] = float(np.clip(blended, -1.0, 1.0))
+            else:
+                # Blend Raw Alpha with Ensemble AI decision
+                blended = (ai_signal * 0.7) + (raw * 0.3)
+                enhanced_signals[sym] = float(np.clip(blended, -1.0, 1.0))
         # ─────────────────────────────────────────────────────────────────────
 
         portfolio_scores = enhanced_signals

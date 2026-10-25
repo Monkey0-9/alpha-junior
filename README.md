@@ -61,6 +61,7 @@ docker-compose up --build -d
 ```
 
 ## 📊 Dashboard
+
 The Streamlit matrix provides real-time visibility into:
 
 - **Market Intelligence**: Regime detection, Ensemble agreement, and Quantitative sentiment.
@@ -68,7 +69,9 @@ The Streamlit matrix provides real-time visibility into:
 - **Audit Log**: Real-time compliance monitoring from the GovernanceEngine.
 
 ## 💾 Data Lake Quick Start
+
 The new Data Engine (Phase 1) provides a complete pipeline to ingest, validate, and query market data:
+
 ```python
 from nexus.data.ingestion.yahoo import YahooFinanceSource
 from nexus.data.storage.parquet_writer import ParquetWriter

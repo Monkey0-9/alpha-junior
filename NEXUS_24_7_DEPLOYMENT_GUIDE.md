@@ -15,11 +15,13 @@ python nexus_24_7.py
 ```
 
 **Advantages**:
+
 - Easy to start
 - Can see output directly
 - Simple to stop (Ctrl+C)
 
 **Disadvantages**:
+
 - Stops if terminal closes
 - Not suitable for long-term production
 
@@ -52,6 +54,7 @@ PowerShell -ExecutionPolicy Bypass -File setup_scheduled_task.ps1 -Action status
 ```
 
 **Advantages**:
+
 - Runs at system startup automatically
 - Auto-restarts if crash occurs
 - Runs as SYSTEM user (highest privileges)
@@ -59,6 +62,7 @@ PowerShell -ExecutionPolicy Bypass -File setup_scheduled_task.ps1 -Action status
 - Survives reboots
 
 **Disadvantages**:
+
 - Requires admin setup
 - Harder to see logs directly
 
@@ -97,6 +101,7 @@ python nexus_service_manager.py status
 ```
 
 **Advantages**:
+
 - Runs as Windows Service
 - Professional deployment
 - Control via Services.msc
@@ -111,6 +116,7 @@ This is the easiest and most reliable for 24/7 operation on a single machine.
 ### Complete Setup Instructions
 
 **1. Open PowerShell as Administrator**
+
 ```powershell
 # Press Windows Key + X
 # Click "Windows PowerShell (Admin)"
@@ -118,26 +124,31 @@ This is the easiest and most reliable for 24/7 operation on a single machine.
 ```
 
 **2. Navigate to project**
+
 ```powershell
 cd C:\mini-quant-fund
 ```
 
 **3. Install the scheduled task**
+
 ```powershell
 PowerShell -ExecutionPolicy Bypass -File setup_scheduled_task.ps1 -Action install
 ```
 
 **4. Verify it was installed**
+
 ```powershell
 PowerShell -ExecutionPolicy Bypass -File setup_scheduled_task.ps1 -Action status
 ```
 
 **5. Start the task immediately**
+
 ```powershell
 Start-ScheduledTask -TaskName "Nexus24x7TradingPlatform"
 ```
 
 **6. Check logs**
+
 ```powershell
 Get-Content logs\nexus_24_7_*.log -Tail 50 -Wait
 ```
@@ -157,6 +168,7 @@ notepad logs\nexus_24_7_2026MMDD.log
 ```
 
 ### Log File Location
+
 ```
 logs\nexus_24_7_YYYYMMDD.log
 ```
@@ -286,11 +298,13 @@ PowerShell -ExecutionPolicy Bypass -File setup_scheduled_task.ps1 -Action instal
 ### Issue: Platform keeps restarting
 
 **Check logs**:
+
 ```powershell
 Get-Content logs\nexus_24_7_*.log -Tail 100
 ```
 
 **Common causes**:
+
 - Alpaca credentials invalid
 - Port already in use
 - Insufficient system resources
@@ -299,6 +313,7 @@ Get-Content logs\nexus_24_7_*.log -Tail 100
 ### Issue: Can't stop the task
 
 **Force stop**:
+
 ```powershell
 Stop-ScheduledTask -TaskName "Nexus24x7TradingPlatform" -Force
 ```
@@ -318,11 +333,11 @@ Remove-Item logs\nexus_24_7_*.log -OlderThan (Get-Date).AddDays(-7)
 For production use, you can monitor via:
 
 1. **Streamlit UI** (while running)
-   - http://localhost:8502
+   - <http://localhost:8502>
    - Shows live positions and P&L
 
 2. **API Documentation**
-   - http://127.0.0.1:8001/docs
+   - <http://127.0.0.1:8001/docs>
    - API health and endpoints
 
 3. **Log Files**
@@ -336,12 +351,14 @@ For production use, you can monitor via:
 ### Credentials Management
 
 Your API keys are stored in `.env`:
+
 ```env
 ALPACA_API_KEY=PKPC4KQVMHQJXXBB3RUZWPB64A
 ALPACA_API_SECRET=GpssKKTRHKc781K96XBF2y3Kqnpfp9a5hjbJqmKtWwES
 ```
 
 ✅ **Security Best Practices**:
+
 - Keep `.env` file secure
 - Never commit `.env` to git
 - Consider encrypting on production server
@@ -350,6 +367,7 @@ ALPACA_API_SECRET=GpssKKTRHKc781K96XBF2y3Kqnpfp9a5hjbJqmKtWwES
 ### Firewall Rules
 
 The system binds to localhost (127.0.0.1):
+
 ```
 API: 127.0.0.1:8001 (Not accessible from network)
 UI:  0.0.0.0:8502   (Local network only)
@@ -393,27 +411,32 @@ Select-String "error" logs\nexus_24_7_*.log
 When ready to trade with REAL money:
 
 1. **Backup current configuration**
+
 ```bash
 copy .env .env.backup
 ```
 
-2. **Update .env file**
+1. **Update .env file**
+
 ```env
 ALPACA_PAPER_TRADING=false    # Switch to LIVE
 ```
 
-3. **Verify Alpaca credentials**
+1. **Verify Alpaca credentials**
+
 ```bash
 python -c "from nexus.utils.config import Config; Config.ensure_ready()"
 ```
 
-4. **Test with small positions first**
+1. **Test with small positions first**
+
 - Start with 1-2% of capital per trade
 - Monitor closely for 24 hours
 - Verify order execution
 - Check P&L tracking
 
-5. **Increase gradually**
+1. **Increase gradually**
+
 - After 1 week: Increase to 3-5% per trade
 - After 1 month: Normal operations
 - Maintain stop-loss and profit targets
@@ -423,16 +446,19 @@ python -c "from nexus.utils.config import Config; Config.ensure_ready()"
 ## 📞 SUPPORT & HELP
 
 ### Verify System is Ready
+
 ```bash
 python verify_production_ready.py
 ```
 
 ### Check Current Configuration
+
 ```bash
 python -c "from nexus.utils.config import Config; print(Config.__dict__)"
 ```
 
 ### Test Alpaca Connection
+
 ```bash
 python -c "from nexus.execution.alpaca import get_client; import asyncio; print(asyncio.run(get_client().get_account()))"
 ```
@@ -459,21 +485,25 @@ Before going live with 24/7 operation:
 ## 🎯 NEXT STEPS
 
 1. **Run setup script** (as Administrator):
+
    ```powershell
    PowerShell -ExecutionPolicy Bypass -File setup_scheduled_task.ps1 -Action install
    ```
 
 2. **Start the task**:
+
    ```powershell
    Start-ScheduledTask -TaskName "Nexus24x7TradingPlatform"
    ```
 
 3. **Verify status**:
+
    ```powershell
    PowerShell -ExecutionPolicy Bypass -File setup_scheduled_task.ps1 -Action status
    ```
 
 4. **Monitor logs**:
+
    ```powershell
    Get-Content logs\nexus_24_7_*.log -Tail 50 -Wait
    ```

@@ -1,4 +1,4 @@
 [flake8]
 max-line-length = 150
 extend-ignore = E203, W503
-exclude = .venv, .venv-1, venv, .git, __pycache__, build, dist, nexus/cpp_extensions/onnxruntime, sympy
+exclude = .venv, .venv-1, venv, .git, __pycache__, build, dist, nexus/cpp_extensions/onnxruntime, sympy, .trunk

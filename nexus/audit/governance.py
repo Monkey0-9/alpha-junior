@@ -54,8 +54,8 @@ class GovernanceEngine:
 
     def __init__(
         self,
-        single_position_limit: float = None,
-        max_drawdown_limit: float = None,
+        single_position_limit: Optional[float] = None,
+        max_drawdown_limit: Optional[float] = None,
     ):
         # Allow overriding limits via environment variables for runtime tuning
         try:

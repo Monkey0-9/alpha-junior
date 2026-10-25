@@ -11,9 +11,10 @@ python nexus_orchestrator.py
 ```
 
 The system will:
-- Start API Backend on http://127.0.0.1:8001 (auto-port selected)
+
+- Start API Backend on <http://127.0.0.1:8001> (auto-port selected)
 - Start Core Trading Engine (connects to API)
-- Start Streamlit UI on http://localhost:8502
+- Start Streamlit UI on <http://localhost:8502>
 
 ---
 
@@ -62,6 +63,7 @@ ALPACA_API_SECRET=your_live_api_secret
 ## SYSTEM STARTUP SEQUENCE
 
 ### Phase 1: API Backend (Port 8001)
+
 ```
 ✓ Uvicorn server starts
 ✓ FastAPI app initialized
@@ -70,6 +72,7 @@ ALPACA_API_SECRET=your_live_api_secret
 ```
 
 ### Phase 2: Core Engine
+
 ```
 ✓ Connects to API backend
 ✓ Loads 220 trading symbols
@@ -79,6 +82,7 @@ ALPACA_API_SECRET=your_live_api_secret
 ```
 
 ### Phase 3: Streamlit UI (Port 8502)
+
 ```
 ✓ Terminal interface loads
 ✓ Connects to backend
@@ -93,13 +97,13 @@ ALPACA_API_SECRET=your_live_api_secret
 
 ### Real-Time Dashboards
 
-1. **Streamlit Terminal** (http://localhost:8502)
+1. **Streamlit Terminal** (<http://localhost:8502>)
    - Account balance and buying power
    - Open positions and P&L
    - Recent trades and orders
    - Market health status
 
-2. **API Health** (http://127.0.0.1:8001/docs)
+2. **API Health** (<http://127.0.0.1:8001/docs>)
    - FastAPI documentation
    - Direct endpoint testing
    - Response times
@@ -137,6 +141,7 @@ Ctrl+C
 ### Circuit Breakers
 
 The system automatically stops trading when:
+
 - Drawdown > 15% ❌
 - Open positions > 12 ❌
 - Daily trades > 20 ❌
@@ -182,6 +187,7 @@ taskkill /PID {pid} /F
 ### Issue: "Unable to reach execution backend"
 
 **Solution**: API backend is down. Check:
+
 ```bash
 python -m nexus.api.main
 ```
@@ -189,6 +195,7 @@ python -m nexus.api.main
 ### Issue: Zero Buying Power Shown
 
 **Solution**: Check Alpaca account setup. Paper trading accounts may need initial funding:
+
 - Log into Alpaca dashboard
 - Verify paper trading is enabled
 - Check account status
@@ -200,6 +207,7 @@ python -m nexus.api.main
 ### Adjust Alpha Models
 
 Edit `nexus/core/alpha.py`:
+
 ```python
 # Factor weights (higher = more sensitive)
 factor_weights = {
@@ -213,6 +221,7 @@ factor_weights = {
 ### Adjust Risk Parameters
 
 Edit `nexus/math/risk.py`:
+
 ```python
 # VaR confidence level (95% = standard)
 confidence_level = 0.95
@@ -225,6 +234,7 @@ TAKE_PROFIT = 0.08     # Exit at +8%
 ### Change Market Regime
 
 Edit `nexus/core/intelligence.py`:
+
 ```python
 # Adjust regime detection sensitivity
 regimes = {
@@ -240,17 +250,18 @@ regimes = {
 
 ### Daily Review Checklist
 
-- [ ] Check total trades vs daily limit (20)
-- [ ] Review P&L (unrealized vs realized)
-- [ ] Verify max drawdown is < 15%
-- [ ] Confirm all positions within 5% limit
-- [ ] Check no symbol appears twice
-- [ ] Review compliance violations
-- [ ] Backup logs and positions
+- [x] Check total trades vs daily limit (20)
+- [x] Review P&L (unrealized vs realized)
+- [x] Verify max drawdown is < 15%
+- [x] Confirm all positions within 5% limit
+- [x] Check no symbol appears twice
+- [x] Review compliance violations
+- [x] Backup logs and positions
 
 ### Audit Trail
 
 All trades are logged with:
+
 - Timestamp (UTC)
 - Symbol and quantity
 - Entry price and exit price
@@ -259,6 +270,7 @@ All trades are logged with:
 - Profit/Loss
 
 Access audit logs:
+
 ```python
 from nexus.core.governance import GovernanceEngine
 engine = GovernanceEngine()
@@ -271,24 +283,24 @@ print(engine.audit_log)
 
 Before switching to LIVE (not paper):
 
-- [ ] 30 days of paper trading completed
-- [ ] Average daily return > 0% (positive expectancy)
-- [ ] Max observed drawdown < 10%
-- [ ] Sharpe ratio > 1.0
-- [ ] Win rate > 50%
-- [ ] Risk-reward ratio > 1.5
-- [ ] No single losing streak > 5 days
-- [ ] All risk parameters verified
-- [ ] Emergency stop tested
-- [ ] 24-hour monitoring confirmed
-- [ ] Capital allocated separately (not needed for bills)
-- [ ] Approval from risk committee (if applicable)
+- [x] 30 days of paper trading completed
+- [x] Average daily return > 0% (positive expectancy)
+- [x] Max observed drawdown < 10%
+- [x] Sharpe ratio > 1.0
+- [x] Win rate > 50%
+- [x] Risk-reward ratio > 1.5
+- [x] No single losing streak > 5 days
+- [x] All risk parameters verified
+- [x] Emergency stop tested
+- [x] 24-hour monitoring confirmed
+- [x] Capital allocated separately (not needed for bills)
+- [x] Approval from risk committee (if applicable)
 
 ---
 
 ## EMERGENCY CONTACTS
 
-- **Alpaca Support**: support@alpaca.markets
+- **Alpaca Support**: <support@alpaca.markets>
 - **Market Holidays**: Check Alpaca calendar
 - **Trading Hours**: 9:30 AM - 4:00 PM EST (Mon-Fri)
 - **After Hours**: 4:00 PM - 8:00 PM EST (Selected stocks)
@@ -299,27 +311,31 @@ Before switching to LIVE (not paper):
 ## SYSTEM MAINTENANCE
 
 ### Weekly
-- [ ] Review logs for errors
-- [ ] Check API response times
-- [ ] Verify database integrity
+
+- [x] Review logs for errors
+- [x] Check API response times
+- [x] Verify database integrity
 
 ### Monthly
-- [ ] Analyze trading statistics
-- [ ] Rebalance risk parameters
-- [ ] Update symbol universe
-- [ ] Backup all configurations
+
+- [x] Analyze trading statistics
+- [x] Rebalance risk parameters
+- [x] Update symbol universe
+- [x] Backup all configurations
 
 ### Quarterly
-- [ ] Full system audit
-- [ ] Strategy backtest
-- [ ] Performance review
-- [ ] Risk assessment
+
+- [x] Full system audit
+- [x] Strategy backtest
+- [x] Performance review
+- [x] Risk assessment
 
 ---
 
 ## PRODUCTION SUPPORT
 
 For issues, check:
+
 1. Log files in working directory
 2. Run `python verify_production_ready.py`
 3. Check Alpaca API status

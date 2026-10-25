@@ -3,7 +3,7 @@ import os
 import time
 import uuid
 import logging
-from typing import Dict, List, Optional, Any, cast
+from typing import Dict, List, Optional, Any, cast, Tuple
 from dataclasses import dataclass
 import aiohttp
 import numpy as np
@@ -46,8 +46,8 @@ class AlpacaClient:
         self.session: Optional[aiohttp.ClientSession] = None
         self.simulator = TradeSimulator()
         self.simulated = False
-        self._bars_cache: Dict[tuple, Dict[str, Any]] = {}
-        self._bars_inflight: Dict[tuple, asyncio.Task] = {}
+        self._bars_cache: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+        self._bars_inflight: Dict[Tuple[Any, ...], asyncio.Task[List[Dict[str, Any]]]] = {}
         self._bars_cache_ttl = 15.0
 
         if credentials is None:
@@ -142,11 +142,22 @@ class AlpacaClient:
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     }
                 if response.status == 401:
-                    logger.warning(
-                        "Alpaca API Keys invalid (401). Falling back to full simulation mode."
+                    logger.error(
+                        "Alpaca API Keys invalid (401). Rejecting connection - silent simulation fallback disabled for safety."
                     )
-                    self.simulated = True
-                    return await self.get_account()
+                    if Config.ALLOW_SIMULATION_FALLBACK:
+                        logger.warning(
+                            "Simulation fallback explicitly permitted by NEXUS_ALLOW_SIMULATION_FALLBACK."
+                        )
+                        self.simulated = True
+                        return await self.get_account()
+                    self.enabled = False
+                    return {
+                        "enabled": False,
+                        "simulated": False,
+                        "status": "UNAUTHORIZED",
+                        "error": "Alpaca API credentials invalid (401). Live execution disabled.",
+                    }
                 return {
                     "enabled": True,
                     "simulated": False,
@@ -219,6 +230,12 @@ class AlpacaClient:
         extended_hours: bool = False,
     ) -> Dict[str, Any]:
         symbol = symbol.upper()
+        if not self.enabled and not self.simulated:
+            logger.error("submit_order rejected: Alpaca execution client is disabled or unauthenticated.")
+            return {
+                "success": False,
+                "error": "Broker client is disabled or unauthenticated. Order rejected.",
+            }
         if self.simulated:
             result: Dict[str, Any]
             bars = await self.get_bars(symbol, timeframe="1Min", limit=1)
@@ -466,7 +483,7 @@ class AlpacaClient:
         now = time.monotonic()
         cached_entry = self._bars_cache.get(cache_key)
         if cached_entry and (now - cached_entry["timestamp"]) < self._bars_cache_ttl:
-            return cached_entry["bars"]
+            return cast(List[Dict[str, Any]], cached_entry["bars"])
 
         inflight_task = self._bars_inflight.get(cache_key)
         if inflight_task is not None:
@@ -530,8 +547,6 @@ class AlpacaClient:
                             logger.warning(
                                 f"Alpaca bars request for {symbol} returned HTTP {response.status}: {await response.text()}"
                             )
-                            break
-                        if retries == 0 or response.status != 429:
                             break
                     # Try the next feed candidate if this feed failed
                 return []

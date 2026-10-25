@@ -9,7 +9,7 @@ import inspect
 import sys
 import logging
 import importlib
-from typing import Dict
+from typing import Dict, Any
 from pathlib import Path
 import httpx
 
@@ -63,20 +63,33 @@ class ProductionVerifier:
         return all_pass
 
     def test_persistence(self) -> bool:
-        """Verify SQLite audit persistence."""
+        """Verify SQLite audit persistence and write integrity."""
         logger.info("\n" + "=" * 60)
         logger.info("2. TESTING PERSISTENCE LAYER")
         logger.info("=" * 60)
 
         db_path = Path("data/nexus_audit.db")
         try:
-            # This should trigger DB initialization
-            logger.info(f"  [OK] Database path: {db_path}")
+            from nexus.audit.governance import GovernanceEngine
+            _ = GovernanceEngine()
+            # Ensure DB file exists after initialization
             if not db_path.exists():
-                logger.warning(
-                    "  ⚠ Database file not found yet (will be created on first audit)"
-                )
+                logger.error("  [FAIL] Database file was not created by GovernanceEngine.")
+                self.results["persistence_init"] = False
+                return False
 
+            import sqlite3
+            conn = sqlite3.connect(str(db_path))
+            cur = conn.cursor()
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='audit_log'")
+            if not cur.fetchone():
+                logger.error("  [FAIL] Required table 'audit_log' does not exist in DB.")
+                conn.close()
+                self.results["persistence_init"] = False
+                return False
+            conn.close()
+
+            logger.info(f"  [OK] Database verified and schema active at: {db_path}")
             self.results["persistence_init"] = True
             return True
         except Exception as e:
@@ -100,39 +113,43 @@ class ProductionVerifier:
             ) as client:
                 # 1. Test Public GET (Brain snapshot)
                 resp = await client.get("/api/monitor/brain")
-                if resp.status_code in {200, 502}:  # 502 OK if market closed
-                    logger.info("  [OK] Public read endpoint is accessible")
-                else:
+                if resp.status_code not in {200, 502}:
                     logger.error(
-                        f"  [FAIL] Public read endpoint returned {resp.status_code}"
+                        f"  [FAIL] Public read endpoint returned unexpected {resp.status_code}"
                     )
+                    self.results["security_hardening"] = False
+                    return False
+                logger.info("  [OK] Public read endpoint is accessible")
 
-                # 2. Test Protected POST (Mutation)
+                # 2. Test Protected POST (Mutation without Key)
                 if Config.API_KEY:
                     resp = await client.post("/api/alpaca/order", json={})
-                    if resp.status_code == 401:
-                        logger.info(
-                            "  [OK] Mutation endpoint is PROTECTED (401 Unauthorized)"
+                    if resp.status_code != 401:
+                        logger.error(
+                            f"  [FAIL] Mutation endpoint allowed unauthorized access! Status: {resp.status_code}"
                         )
-                    else:
-                        logger.warning(
-                            f"  ⚠ Mutation endpoint returned {resp.status_code} (expected 401)"
-                        )
+                        self.results["security_hardening"] = False
+                        return False
+                    logger.info(
+                        "  [OK] Mutation endpoint is STRICTLY PROTECTED (401 Unauthorized)"
+                    )
 
-                    # 3. Test Authorized POST with key
+                    # 3. Test Authorized POST with valid key
                     resp = await client.post(
                         "/api/alpaca/order",
                         json={},
                         headers={"X-API-Key": Config.API_KEY},
                     )
-                    if resp.status_code == 422:
-                        logger.info(
-                            "  [OK] Mutation endpoint is ACCESSIBLE with valid API Key"
+                    # 422 is expected for empty body validation error, 403 for pre-trade guard rejection
+                    if resp.status_code not in {422, 403}:
+                        logger.error(
+                            f"  [FAIL] Authorized mutation returned unexpected status: {resp.status_code}"
                         )
-                    else:
-                        logger.warning(
-                            f"  ⚠ Mutation endpoint with key returned {resp.status_code} (expected 422)"
-                        )
+                        self.results["security_hardening"] = False
+                        return False
+                    logger.info(
+                        f"  [OK] Mutation endpoint is ACCESSIBLE with valid API Key (Status: {resp.status_code})"
+                    )
 
             self.results["security_hardening"] = True
             return True
@@ -188,21 +205,130 @@ class ProductionVerifier:
 
             client = get_client()
             if not client.enabled:
-                logger.warning("  ⚠ Alpaca client not enabled (Simulator mode active)")
-                self.results["alpaca_connection"] = True
-                return True
+                from nexus.utils.config import Config
+                if Config.ALLOW_SIMULATION_FALLBACK:
+                    logger.warning("  ⚠ Alpaca client not enabled (Simulator mode explicitly permitted)")
+                    self.results["alpaca_connection"] = True
+                    return True
+                else:
+                    logger.error("  [FAIL] Alpaca client is disabled and simulation fallback is disallowed.")
+                    self.results["alpaca_connection"] = False
+                    return False
 
             account = await client.get_account()
+            if account.get("status") in {"ERROR", "UNAUTHORIZED"}:
+                logger.error(
+                    f"  [FAIL] Alpaca broker authentication failed: {account.get('error', 'UNAUTHORIZED')}"
+                )
+                self.results["alpaca_connection"] = False
+                return False
+
             logger.info(
                 f"  [OK] Connected to Alpaca. Status: {account.get('status', 'ACTIVE')}"
             )
-            # Do NOT close the client here, it's a singleton and we might use it later
-            # or it might have been initialized by something else.
             self.results["alpaca_connection"] = True
             return True
         except Exception as e:
             logger.error(f"  [FAIL] Alpaca connection error: {e}")
             self.results["alpaca_connection"] = False
+            return False
+
+    async def test_pre_trade_guard(self) -> bool:
+        """Verify PreTradeRiskGuard non-bypassable pre-trade boundary."""
+        logger.info("\n" + "=" * 60)
+        logger.info("6. TESTING PRE-TRADE RISK GUARD")
+        logger.info("=" * 60)
+
+        try:
+            from nexus.risk.pre_trade_guard import PreTradeRiskGuard
+            from nexus.execution.alpaca import AlpacaClient, AlpacaCredentials
+
+            guard = PreTradeRiskGuard()
+            client = AlpacaClient(credentials=AlpacaCredentials("TEST_KEY", "TEST_SECRET"))
+            client.enabled = False
+
+            # 1. Disabled broker rejection
+            res = await guard.validate_and_submit(
+                client=client, order_request={"symbol": "AAPL", "qty": 10, "side": "buy"}
+            )
+            if res.get("status") != "rejected":
+                logger.error("  [FAIL] PreTradeRiskGuard allowed order on disabled broker")
+                self.results["pre_trade_guard"] = False
+                return False
+            logger.info("  [OK] Disabled broker fail-closed check enforced")
+
+            # 2. Position concentration gate
+            client.enabled = True
+            client.simulated = False
+            empty_pos: list[dict[str, Any]] = []
+            portfolio = {"total_value": 10000.0, "drawdown": 0.0, "positions": empty_pos}
+            res2 = await guard.validate_and_submit(
+                client=client,
+                order_request={"symbol": "AAPL", "qty": 100, "price": 100.0, "side": "buy"},
+                portfolio_state=portfolio,
+            )
+            if res2.get("status") != "rejected":
+                logger.error("  [FAIL] PreTradeRiskGuard allowed oversized 100% position")
+                self.results["pre_trade_guard"] = False
+                return False
+            logger.info("  [OK] Position concentration limit strictly enforced")
+
+            self.results["pre_trade_guard"] = True
+            return True
+        except Exception as e:
+            logger.error(f"  [FAIL] Pre-trade risk guard test error: {e}")
+            self.results["pre_trade_guard"] = False
+            return False
+
+    def test_universe_filter(self) -> bool:
+        """Verify UniverseManager asset filtering and liquidity rules."""
+        logger.info("\n" + "=" * 60)
+        logger.info("7. TESTING UNIVERSE MANAGER & ASSET FILTERS")
+        logger.info("=" * 60)
+
+        try:
+            from nexus.universe import UniverseManager
+
+            mgr = UniverseManager()
+            raw = [
+                {"symbol": "AAPL", "exchange": "NASDAQ", "tradable": True, "status": "active"},
+                {"symbol": "PENNY", "exchange": "OTC", "tradable": True, "status": "active"},
+                {"symbol": "UVXY", "exchange": "ARCA", "tradable": True, "status": "active"},
+            ]
+            selected = mgr.select_universe(raw, max_symbols=5)
+            if "AAPL" not in selected or "PENNY" in selected or "UVXY" in selected:
+                logger.error(f"  [FAIL] Unexpected universe selection result: {selected}")
+                self.results["universe_filter"] = False
+                return False
+            logger.info(f"  [OK] Dynamic universe filters active (Selected: {selected})")
+            self.results["universe_filter"] = True
+            return True
+        except Exception as e:
+            logger.error(f"  [FAIL] Universe filter error: {e}")
+            self.results["universe_filter"] = False
+            return False
+
+    def test_polyglot_defense(self) -> bool:
+        """Verify PolyglotBridge defense-in-depth and fallbacks."""
+        logger.info("\n" + "=" * 60)
+        logger.info("8. TESTING POLYGLOT DEFENSE-IN-DEPTH")
+        logger.info("=" * 60)
+
+        try:
+            from nexus.utils.polyglot_bridge import PolyglotBridge
+
+            # Invalid qty
+            invalid_res = PolyglotBridge.validate_order_zig({"symbol": "AAPL", "qty": -5, "price": 100.0})
+            if invalid_res.get("valid", True):
+                logger.error("  [FAIL] PolyglotBridge failed to reject negative quantity")
+                self.results["polyglot_defense"] = False
+                return False
+            logger.info("  [OK] Polyglot order boundary validator active")
+            self.results["polyglot_defense"] = True
+            return True
+        except Exception as e:
+            logger.error(f"  [FAIL] Polyglot defense error: {e}")
+            self.results["polyglot_defense"] = False
             return False
 
     async def run_all_checks(self) -> bool:
@@ -217,6 +343,9 @@ class ProductionVerifier:
             self.test_security_hardening,
             self.test_quantitative_integrity,
             self.test_alpaca_connection,
+            self.test_pre_trade_guard,
+            self.test_universe_filter,
+            self.test_polyglot_defense,
         ]
 
         all_passed = True
@@ -235,7 +364,7 @@ class ProductionVerifier:
         return all_passed
 
 
-async def main():
+async def main() -> int:
     verifier = ProductionVerifier()
     passed = await verifier.run_all_checks()
 

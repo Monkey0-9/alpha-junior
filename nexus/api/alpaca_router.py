@@ -4,6 +4,7 @@ from pydantic import BaseModel
 import logging
 from nexus.execution.alpaca import get_client, AlpacaClient
 from nexus.utils.config import Config
+from nexus.risk.pre_trade_guard import PreTradeRiskGuard
 
 logger = logging.getLogger(__name__)
 
@@ -86,21 +87,15 @@ async def get_order_status(
 async def submit_order(
     order: OrderRequest, client: AlpacaClient = Depends(get_alpaca)
 ) -> Dict[str, Any]:
-    return await client.submit_order(
-        order.symbol,
-        order.qty,
-        order.side,
-        asset_class=order.asset_class,
-        order_type=order.order_type,
-        time_in_force=order.time_in_force,
-        limit_price=order.limit_price,
-        stop_price=order.stop_price,
-        trail_price=order.trail_price,
-        trail_percent=order.trail_percent,
-        client_order_id=order.client_order_id,
-        extended_hours=order.extended_hours,
-        strategy=order.strategy,
-    )
+    guard = PreTradeRiskGuard.get_instance()
+    order_dict = order.model_dump() if hasattr(order, "model_dump") else order.dict()
+    result = await guard.validate_and_submit(client, order_dict)
+    if result.get("status") == "rejected":
+        raise HTTPException(
+            status_code=403,
+            detail=result.get("error", "Order rejected by pre-trade risk guard."),
+        )
+    return result
 
 
 @router.post("/cancel")
@@ -114,14 +109,32 @@ async def cancel_order(
 async def buy_stock(
     symbol: str, qty: float, client: AlpacaClient = Depends(get_alpaca)
 ) -> Dict[str, Any]:
-    return await client.submit_order(symbol, qty, "buy")
+    guard = PreTradeRiskGuard.get_instance()
+    result = await guard.validate_and_submit(
+        client, {"symbol": symbol, "qty": qty, "side": "buy"}
+    )
+    if result.get("status") == "rejected":
+        raise HTTPException(
+            status_code=403,
+            detail=result.get("error", "Order rejected by pre-trade risk guard."),
+        )
+    return result
 
 
 @router.post("/sell")
 async def sell_stock(
     symbol: str, qty: float, client: AlpacaClient = Depends(get_alpaca)
 ) -> Dict[str, Any]:
-    return await client.submit_order(symbol, qty, "sell")
+    guard = PreTradeRiskGuard.get_instance()
+    result = await guard.validate_and_submit(
+        client, {"symbol": symbol, "qty": qty, "side": "sell"}
+    )
+    if result.get("status") == "rejected":
+        raise HTTPException(
+            status_code=403,
+            detail=result.get("error", "Order rejected by pre-trade risk guard."),
+        )
+    return result
 
 
 @router.get("/bars")

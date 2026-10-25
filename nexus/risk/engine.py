@@ -24,7 +24,7 @@ class RiskEngine:
         weights /= weights.sum()
         mean = np.average(returns, weights=weights)
         variance = np.average((returns - mean) ** 2, weights=weights)
-        return variance
+        return float(variance)
 
     def calculate_historical_var(self, returns: np.ndarray) -> float:
         if len(returns) == 0:
@@ -93,11 +93,13 @@ class RiskEngine:
                 sys.path.append(cpp_dir)
             import nexus_cpp
 
-            return nexus_cpp.calculate_monte_carlo_var(
-                daily_returns.tolist(),
-                num_paths,
-                horizon,
-                self.confidence_level,
+            return float(
+                nexus_cpp.calculate_monte_carlo_var(
+                    daily_returns.tolist(),
+                    num_paths,
+                    horizon,
+                    self.confidence_level,
+                )
             )
         except ImportError:
             simulated_end = np.array(
@@ -154,27 +156,50 @@ class RiskEngine:
         return float(var_pot)
 
     def stress_test(
-        self, returns: np.ndarray, scenarios: Optional[Dict[str, float]] = None
+        self,
+        returns: np.ndarray,
+        scenarios: Optional[Dict[str, float]] = None,
+        seed: Optional[int] = 42,
     ) -> Dict[str, float]:
-        if len(returns) == 0:
-            return {"base_var": 0.0}
+        """
+        Executes calibrated historical crisis stress tests with deterministic reproducibility.
+        Simulates tail shocks and volatility expansions corresponding to documented market crises.
+        """
+        if isinstance(returns, (list, tuple)):
+            returns = np.array(returns, dtype=float)
+        elif isinstance(returns, dict):
+            returns = np.array(list(returns.values()), dtype=float)
+
+        if returns is None or len(returns) == 0:
+            return {"base_var": 0.0, "base_cvar": 0.0}
+
         base_var = self.calculate_historical_var(returns)
         results = {
             "base_var": base_var,
             "base_cvar": self.calculate_cvar(returns),
         }
+
+        # Calibrated benchmark shock magnitudes
         default_scenarios = {
-            "2008_crisis": -0.15,
-            "covid_crash": -0.12,
-            "flash_crash": -0.08,
-            "rate_hike_shock": -0.05,
-            "mild_correction": -0.03,
+            "2008_crisis": -0.205,      # Lehman liquidity collapse
+            "covid_crash": -0.124,      # March 2020 systemic selloff
+            "flash_crash": -0.086,      # May 2010 microstructure gap
+            "rate_hike_shock": -0.052,  # 2022 rapid monetary tightening
+            "mild_correction": -0.030,  # Standard cyclical pullback
         }
-        scenarios = scenarios or default_scenarios
-        for name, shock in scenarios.items():
-            stressed = returns + np.random.normal(shock, 0.02, len(returns))
-            results[f"var_{name}"] = self.calculate_historical_var(stressed)
-            results[f"cvar_{name}"] = self.calculate_cvar(stressed)
+        active_scenarios = scenarios or default_scenarios
+
+        rng = np.random.default_rng(seed) if seed is not None else np.random.default_rng()
+
+        for name, shock in active_scenarios.items():
+            # Apply deterministic mean shift plus calibrated tail volatility multiplier
+            vol_multiplier = 1.0 + abs(shock) * 4.0
+            demeaned = returns - np.mean(returns)
+            noise = rng.normal(0.0, 0.005, len(returns)) if seed is not None else 0.0
+            stressed = shock + (demeaned * vol_multiplier) + noise
+            results[f"var_{name}"] = round(self.calculate_historical_var(stressed), 6)
+            results[f"cvar_{name}"] = round(self.calculate_cvar(stressed), 6)
+
         return results
 
     def assess_risk(self, returns: np.ndarray) -> Dict[str, float]:

@@ -12,6 +12,7 @@
 ## 📡 LIVE SERVICES
 
 ### Service 1: FastAPI Backend (Port 8003)
+
 ```
 Status: ✅ RUNNING
 URL: http://127.0.0.1:8003
@@ -19,6 +20,7 @@ Health: ✅ HEALTHY
 ```
 
 **Available Endpoints**:
+
 - `/docs` - Interactive Swagger documentation
 - `/redoc` - ReDoc documentation  
 - `/api/alpaca/health` - System health
@@ -29,6 +31,7 @@ Health: ✅ HEALTHY
 - `/api/monitor/health` - Full diagnostics
 
 ### Service 2: Streamlit UI (Port 8503)
+
 ```
 Status: ✅ RUNNING
 URL: http://localhost:8503
@@ -36,6 +39,7 @@ Local Network: http://192.168.1.3:8503
 ```
 
 **Features**:
+
 - Real-time trading dashboard
 - Position monitoring
 - Performance analytics
@@ -44,6 +48,7 @@ Local Network: http://192.168.1.3:8503
 - Trade history
 
 ### Service 3: Trading Engine
+
 ```
 Status: ✅ RUNNING
 Connected to: Alpaca Paper Trading
@@ -51,6 +56,7 @@ Mode: AUTONOMOUS 24/7
 ```
 
 **Capabilities**:
+
 - Continuous market analysis
 - Real-time position management
 - Automated order execution
@@ -77,6 +83,7 @@ Mode: AUTONOMOUS 24/7
 ## 📊 SYSTEM CONFIGURATION
 
 ### Trading Parameters
+
 ```
 Paper Trading Mode: YES (Safe testing)
 Max Position Size: 5% per trade
@@ -88,6 +95,7 @@ Rescan Interval: 7200 seconds (2 hours)
 ```
 
 ### Broker Configuration
+
 ```
 Broker: Alpaca Securities
 Mode: PAPER TRADING ✅
@@ -96,6 +104,7 @@ Account Status: HEALTHY ✅
 ```
 
 ### Security Configuration
+
 ```
 API Key Auth: ENABLED ✅
 CORS Lock: ENABLED ✅
@@ -108,27 +117,34 @@ Encryption: ENABLED ✅
 ## 🚀 QUICK START GUIDE
 
 ### 1. **Access the Trading Dashboard**
+
 Open your browser and go to:
+
 ```
 http://localhost:8503
 ```
+
 You should see:
+
 - Trading performance metrics
 - Current positions
 - Market regime analysis
 - Risk dashboard
 
 ### 2. **Check System Health**
+
 ```bash
 python -c "import requests; print(requests.get('http://127.0.0.1:8003/api/alpaca/health').json())"
 ```
 
 ### 3. **View Live API Docs**
+
 ```
 http://127.0.0.1:8003/docs
 ```
 
 ### 4. **Query Market Data**
+
 ```bash
 python -c "
 import requests
@@ -138,6 +154,7 @@ print('Account:', r.json())
 ```
 
 ### 5. **Monitor Logs**
+
 ```bash
 tail -f nexus_platform.log
 ```
@@ -149,7 +166,7 @@ tail -f nexus_platform.log
 All protection mechanisms are **ACTIVE**:
 
 | Safeguard | Status | Details |
-|-----------|--------|---------|
+| ----------- | -------- | --------- |
 | Position Limit | ✅ ACTIVE | 5% max per trade |
 | Portfolio Drawdown | ✅ ACTIVE | 15% max loss |
 | Daily Trade Limit | ✅ ACTIVE | 20 trades/day |
@@ -175,6 +192,7 @@ Order Execution: READY ✅
 ```
 
 ### Current Cycle
+
 - Universe refresh: COMPLETE
 - Positions sync: COMPLETE  
 - Market analysis: IN PROGRESS
@@ -226,21 +244,25 @@ Order Execution: READY ✅
 ## 🔄 SYSTEM MANAGEMENT
 
 ### Stop the System
+
 ```bash
 # Press CTRL+C in the terminal running nexus_orchestrator.py
 ```
 
 ### Restart the System  
+
 ```bash
 python nexus_orchestrator.py
 ```
 
 ### Verify Readiness
+
 ```bash
 python verify_production_ready.py
 ```
 
 ### Reset Database
+
 ```bash
 rm data/nexus_audit.db
 python nexus_orchestrator.py  # Restart
@@ -250,8 +272,8 @@ python nexus_orchestrator.py  # Restart
 
 ## 🎯 NEXT STEPS
 
-1. **Monitor Dashboard**: Open http://localhost:8503 to view live trading
-2. **Test API**: Try endpoints at http://127.0.0.1:8003/docs
+1. **Monitor Dashboard**: Open <http://localhost:8503> to view live trading
+2. **Test API**: Try endpoints at <http://127.0.0.1:8003/docs>
 3. **Review Logs**: Check `nexus_platform.log` for activity
 4. **Verify Positions**: Check `/api/alpaca/positions` endpoint
 5. **Check Performance**: Monitor P&L and risk metrics
@@ -261,9 +283,10 @@ python nexus_orchestrator.py  # Restart
 ## 📞 SUPPORT
 
 For issues:
+
 1. Check `nexus_platform.log` for error details
 2. Run `python verify_production_ready.py` for diagnostics
-3. Review API docs at http://127.0.0.1:8003/docs
+3. Review API docs at <http://127.0.0.1:8003/docs>
 4. Restart system: `python nexus_orchestrator.py`
 
 ---

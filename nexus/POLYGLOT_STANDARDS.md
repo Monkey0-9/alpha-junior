@@ -17,6 +17,7 @@ To achieve "Top 1% in the World" performance, Nexus utilizes a multi-runtime sat
 ## 🛠️ Toolchain Deployment
 
 The following compilers must be available on the production host:
+
 - `rustc` / `cargo` (Latest stable)
 - `go` (1.21+)
 - `zig` (0.11+)

@@ -32,7 +32,7 @@ class DuckDBHelper:
             query = f"""
             CREATE OR REPLACE VIEW market_data AS
             SELECT * FROM read_parquet('{self.lake_base_path}/*/*/*.parquet', hive_partitioning=true);
-            """
+            """  # noqa: S608 # nosec B608
             self.conn.execute(query)
             logger.info("Registered 'market_data' view in DuckDB.")
         except Exception as e:

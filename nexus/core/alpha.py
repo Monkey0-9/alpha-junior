@@ -1,4 +1,5 @@
-import nexus_cpp
+import sys
+import os
 import asyncio
 import logging
 import time
@@ -6,15 +7,8 @@ import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Any, Tuple, Optional
-import sys
-import os
 
-from nexus.math.models import KalmanFilter
-from nexus.math.indicators import HawkesProcess, compute_hurst_exponent
-from nexus.execution.alpaca import get_client
-from nexus.utils.config import Config
-from nexus.core.sentiment import SentimentEngine
-
+# Set DLL and C++ extension search path before native import
 mingw_bin = os.path.expanduser(r"~\scoop\apps\mingw\current\bin")
 if os.path.exists(mingw_bin):
     if hasattr(os, "add_dll_directory"):
@@ -27,6 +21,14 @@ cpp_dir = os.path.abspath(
 )
 if cpp_dir not in sys.path:
     sys.path.append(cpp_dir)
+
+import nexus_cpp  # noqa: E402
+
+from nexus.math.models import KalmanFilter  # noqa: E402
+from nexus.math.indicators import HawkesProcess, compute_hurst_exponent  # noqa: E402
+from nexus.execution.alpaca import get_client  # noqa: E402
+from nexus.utils.config import Config  # noqa: E402
+from nexus.core.sentiment import SentimentEngine  # noqa: E402
 
 
 logger = logging.getLogger(__name__)
@@ -133,7 +135,7 @@ class AlphaEngine:
     async def _fetch_with_backoff(
         self, symbol: str, timeframe: str, limit: int
     ) -> pd.DataFrame:
-        bars = []
+        bars: List[Dict[str, Any]] = []
         for attempt in range(2):
             try:
                 days_to_lookback = (limit // 390) + 3
@@ -199,9 +201,9 @@ class AlphaEngine:
 
     def _normalize_columns(self, df: pd.DataFrame, limit: int) -> pd.DataFrame:
         if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [str(c[0]).lower() for c in df.columns]
+            df.columns = pd.Index([str(c[0]).lower() for c in df.columns])
         else:
-            df.columns = [str(c).lower() for c in df.columns]
+            df.columns = pd.Index([str(c).lower() for c in df.columns])
         rename_map = {"adj close": "close", "unadjusted close": "close"}
         for k, v in rename_map.items():
             if k in df.columns and v not in df.columns:
@@ -220,6 +222,7 @@ class AlphaEngine:
         sentiment_score: float = 0.0,
         peer_data: Optional[Dict[str, pd.Series]] = None,
         peer_symbols: Optional[List[str]] = None,
+        symbol: Optional[str] = None,
     ) -> float:
         if data.empty or "close" not in data.columns:
             return 0.0
@@ -262,9 +265,10 @@ class AlphaEngine:
         if Config.SENTIMENT_ENABLED:
             sentiment_adj = sentiment_score * Config.SENTIMENT_WEIGHT
         cross_asset_alpha = 0.0
+        target_sym = symbol or "SPY"
         if peer_data and peer_symbols:
             cross_asset_alpha = self.cross_asset.compute_pair_alpha(
-                "SPY", peer_symbols, peer_data
+                target_sym, peer_symbols, peer_data
             )
         base_signal = (
             (
@@ -376,17 +380,21 @@ class AlphaEngine:
                     if not d.empty:
                         peer_prices[ps] = d["close"]
                 alpha_15m = (
-                    self.generate_signal(data_15m, sentiment, peer_prices, peer_symbols)
+                    self.generate_signal(
+                        data_15m, sentiment, peer_prices, peer_symbols, symbol=symbol
+                    )
                     if not data_15m.empty
                     else 0.0
                 )
                 alpha_1m = (
-                    self.generate_signal(data_1m, sentiment)
+                    self.generate_signal(data_1m, sentiment, symbol=symbol)
                     if not data_1m.empty
                     else 0.0
                 )
                 alpha_1d = (
-                    self.generate_signal(data_1d, sentiment, peer_prices, peer_symbols)
+                    self.generate_signal(
+                        data_1d, sentiment, peer_prices, peer_symbols, symbol=symbol
+                    )
                     if not data_1d.empty
                     else 0.0
                 )

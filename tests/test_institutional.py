@@ -3,7 +3,7 @@ from nexus.audit.governance import GovernanceEngine
 from nexus.portfolio.optimization import PortfolioOptimizer, MultiFactorEngine
 
 
-def test_governance_concentration():
+def test_governance_concentration() -> None:
     engine = GovernanceEngine(single_position_limit=0.1)
     portfolio = {"total_value": 100000, "drawdown": 0.02}
 
@@ -29,7 +29,7 @@ def test_governance_concentration():
     assert any("POSITION_CONCENTRATION" in v for v in violations)
 
 
-def test_governance_drawdown():
+def test_governance_drawdown() -> None:
     engine = GovernanceEngine(max_drawdown_limit=0.1)
     trade = {"symbol": "AAPL", "qty": 1, "price": 150, "side": "buy"}
 
@@ -45,7 +45,7 @@ def test_governance_drawdown():
     assert any("DRAWDOWN_BREACH" in v for v in violations)
 
 
-def test_portfolio_optimizer():
+def test_portfolio_optimizer() -> None:
     optimizer = PortfolioOptimizer()
     symbols = ["AAPL", "MSFT", "GOOGL"]
     signals = [0.8, 0.4, 0.9]
@@ -54,7 +54,11 @@ def test_portfolio_optimizer():
     # Kelly optimizer may drop low-conviction symbols below MIN_POSITION floor
     # — expected
     assert len(weights) >= 1
-    assert abs(sum(weights.values()) - 1.0) < 1e-6
+    # Strict institutional guarantee: every position <= MAX_POSITION and total <= 1.0
+    for sym, w in weights.items():
+        assert w <= optimizer.MAX_POSITION + 1e-6
+    assert sum(weights.values()) <= 1.0 + 1e-6
+
     # Strongest signal (GOOGL) should have highest weight among included
     # symbols
     assert "GOOGL" in weights
@@ -64,8 +68,17 @@ def test_portfolio_optimizer():
     if "MSFT" in weights and "GOOGL" in weights:
         assert weights["GOOGL"] >= weights["MSFT"]
 
+    # Verify full allocation when 5+ high-conviction symbols are present
+    full_symbols = ["AAPL", "MSFT", "GOOGL", "AMZN", "META"]
+    full_signals = [0.9, 0.9, 0.9, 0.9, 0.9]
+    full_weights = optimizer.optimize_weights(full_symbols, full_signals)
+    assert len(full_weights) == 5
+    for sym, w in full_weights.items():
+        assert w <= optimizer.MAX_POSITION + 1e-6
+    assert abs(sum(full_weights.values()) - 1.0) < 1e-5
 
-def test_factor_engine_ranking():
+
+def test_factor_engine_ranking() -> None:
     engine = MultiFactorEngine()
     signals = {"AAPL": 0.5, "MSFT": -0.2, "TSLA": 0.8}
     # Constant data to focus on alpha signal dominance in this test

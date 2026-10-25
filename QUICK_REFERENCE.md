@@ -6,9 +6,10 @@
 python nexus_orchestrator.py
 ```
 
-**Output**: 
-- API: http://127.0.0.1:8001 (auto-selected port)
-- UI: http://localhost:8502
+**Output**:
+
+- API: <http://127.0.0.1:8001> (auto-selected port)
+- UI: <http://localhost:8502>
 
 ---
 
@@ -37,6 +38,7 @@ Network UI:       http://192.168.1.3:8502
 ## IMPORTANT CONFIGURATION (.env)
 
 ### Risk Parameters
+
 ```env
 NEXUS_MAX_POSITION_SIZE=0.05        # 5% per trade (adjust for risk)
 NEXUS_MAX_DRAWDOWN=0.15             # 15% portfolio max loss
@@ -45,6 +47,7 @@ NEXUS_MAX_DAILY_TRADES=20           # 20 trades per day
 ```
 
 ### Broker Settings
+
 ```env
 ALPACA_PAPER_TRADING=true           # Set to false for LIVE (⚠️ CAUTION)
 ALPACA_API_KEY=your_key
@@ -71,21 +74,25 @@ Ctrl+C
 ## MONITORING COMMANDS
 
 ### Check System Status
+
 ```bash
 python -c "from nexus.utils.config import Config; Config.ensure_ready()"
 ```
 
 ### View Recent Trades
+
 ```bash
 python -c "from nexus.execution.alpaca import get_client; import asyncio; print(asyncio.run(get_client().get_orders(status='all', limit=10)))"
 ```
 
 ### View Open Positions
+
 ```bash
 python -c "from nexus.execution.alpaca import get_client; import asyncio; print(asyncio.run(get_client().get_positions()))"
 ```
 
 ### Check Account
+
 ```bash
 python -c "from nexus.execution.alpaca import get_client; import asyncio; acc=asyncio.run(get_client().get_account()); print(f'Status: {acc.get(\"status\")}\nBuying Power: ${acc.get(\"buying_power\", 0):.2f}')"
 ```
@@ -95,6 +102,7 @@ python -c "from nexus.execution.alpaca import get_client; import asyncio; acc=as
 ## TROUBLESHOOTING
 
 ### Port Already in Use
+
 ```bash
 # Check what's using the port:
 netstat -ano | findstr :8001
@@ -104,12 +112,14 @@ taskkill /PID {pid} /F
 ```
 
 ### Reset Virtual Environment
+
 ```bash
 .\.venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
 ### View Logs
+
 ```bash
 # Tail logs (requires PowerShell):
 Get-Content nexus_platform.log -Tail 50 -Wait
@@ -226,24 +236,28 @@ API Docs:        http://127.0.0.1:8001/docs (when running)
 ## QUICK SWITCHES
 
 ### From Paper to LIVE Trading (⚠️ USE CAUTION)
+
 ```env
 # In .env file:
 ALPACA_PAPER_TRADING=false
 ```
 
 ### From LIVE to Paper Trading (Safe)
+
 ```env
 # In .env file:
 ALPACA_PAPER_TRADING=true
 ```
 
 ### Reduce Risk (Conservative)
+
 ```env
 NEXUS_MAX_POSITION_SIZE=0.02       # 2% per trade
 NEXUS_MAX_OPEN_POSITIONS=6         # 6 concurrent
 ```
 
 ### Increase Risk (Aggressive)
+
 ```env
 NEXUS_MAX_POSITION_SIZE=0.10       # 10% per trade
 NEXUS_MAX_OPEN_POSITIONS=20        # 20 concurrent
@@ -267,6 +281,7 @@ CPU Usage:        <25% average
 ## ALERT THRESHOLDS
 
 System alerts when:
+
 - Drawdown exceeds 15%
 - Single position exceeds 5%
 - Daily trades exceed 20
