@@ -8,6 +8,7 @@ without passing this unified gate.
 
 import logging
 import math
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 from nexus.audit.governance import GovernanceEngine
 from nexus.utils.polyglot_bridge import PolyglotBridge
@@ -102,8 +103,38 @@ class PreTradeRiskGuard:
                     "status": "rejected",
                     "error": "No trustworthy current market price is available; order rejected.",
                 }
+            latest_bar = bars[-1]
+            if not client.simulated:
+                timestamp = latest_bar.get("t") or latest_bar.get("timestamp") or latest_bar.get("time")
+                if not isinstance(timestamp, str) or not timestamp.strip():
+                    return {
+                        "success": False,
+                        "status": "rejected",
+                        "error": "Market bar has no timestamp; order rejected.",
+                    }
+                try:
+                    timestamp_text = timestamp.strip()
+                    if timestamp_text.endswith("Z"):
+                        timestamp_text = timestamp_text[:-1] + "+00:00"
+                    bar_time = datetime.fromisoformat(timestamp_text)
+                    if bar_time.tzinfo is None:
+                        raise ValueError("timestamp lacks timezone")
+                    age_seconds = (datetime.now(timezone.utc) - bar_time.astimezone(timezone.utc)).total_seconds()
+                    max_age = max(1, int(Config.MAX_MARKET_DATA_AGE_SECONDS))
+                    if age_seconds < -60 or age_seconds > max_age:
+                        return {
+                            "success": False,
+                            "status": "rejected",
+                            "error": f"Market data is stale or future-dated (age={age_seconds:.1f}s, limit={max_age}s); order rejected.",
+                        }
+                except (TypeError, ValueError, OverflowError):
+                    return {
+                        "success": False,
+                        "status": "rejected",
+                        "error": "Market bar timestamp is invalid; order rejected.",
+                    }
             try:
-                price_value = float(bars[-1].get("close", bars[-1].get("c", 0.0)))
+                price_value = float(latest_bar.get("close", latest_bar.get("c", 0.0)))
             except (TypeError, ValueError, KeyError):
                 price_value = 0.0
         if not math.isfinite(price_value) or price_value <= 0:
