@@ -64,7 +64,8 @@ async def test_engine_crisis_correlation() -> None:
     engine = NexusEngine()
 
     # Force a turbulent regime by returning highly volatile benchmark data
-    volatile_close = [100, 95, 105, 90, 110, 85, 115, 80, 120, 75, 125]
+    volatile_pattern = [100, 95, 105, 90, 110, 85, 115, 80, 120, 75, 125]
+    volatile_close = volatile_pattern * 4  # >20 return observations for risk validation
     setattr(
         engine.alpha_engine,
         "fetch_market_data",
