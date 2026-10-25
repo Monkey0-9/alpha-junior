@@ -462,11 +462,17 @@ class NexusEngine:
         if returns_list.size > 0:
             rust_risk = PolyglotBridge.calculate_risk_rust(returns_list.tolist())
             risk_metrics = self.risk_engine.assess_risk(returns_list)
-            if rust_risk.get("status") == "OK":
-                risk_metrics["rust_var"] = float(rust_risk["var"])
-                risk_metrics["rust_expected_shortfall"] = float(
-                    rust_risk["expected_shortfall"]
-                )
+            rust_var = rust_risk.get("var")
+            rust_expected_shortfall = rust_risk.get("expected_shortfall")
+            if (
+                rust_risk.get("status") == "OK"
+                and isinstance(rust_var, (int, float))
+                and isinstance(rust_expected_shortfall, (int, float))
+                and np.isfinite(rust_var)
+                and np.isfinite(rust_expected_shortfall)
+            ):
+                risk_metrics["rust_var"] = float(rust_var)
+                risk_metrics["rust_expected_shortfall"] = float(rust_expected_shortfall)
             else:
                 # Omit unavailable native numbers rather than recording fake zero risk.
                 logger.warning(
