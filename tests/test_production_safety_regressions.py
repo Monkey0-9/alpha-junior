@@ -54,6 +54,53 @@ async def test_liveness_endpoint_is_public(monkeypatch):
     assert response.status_code == 200
 
 
+@pytest.mark.asyncio
+async def test_engine_account_failure_aborts_cycle_before_orders(monkeypatch):
+    from unittest.mock import AsyncMock, patch
+    from nexus.core.engine import NexusEngine
+
+    engine = NexusEngine()
+    engine.refresh_universe = AsyncMock()
+    engine.last_universe_refresh = __import__("time").time()
+    engine._verify_order_fills = AsyncMock()
+    engine.get_account_state = AsyncMock(side_effect=RuntimeError("account unavailable"))
+    engine.get_positions = AsyncMock(return_value=[])
+    engine.health_monitor.record = MagicMock()
+    engine.health_monitor.heartbeat = MagicMock()
+
+    with patch.object(engine, "_get_client", new_callable=AsyncMock) as get_client:
+        client = MagicMock()
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {"is_open": True}
+        client.get = AsyncMock(return_value=response)
+        get_client.return_value = client
+        with patch.object(engine, "_submit_trade", new_callable=AsyncMock) as submit:
+            await engine.run_cycle()
+            submit.assert_not_awaited()
+            engine.get_positions.assert_not_awaited()
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_position_read_failure_is_not_empty_portfolio():
+    from unittest.mock import AsyncMock, MagicMock
+    from nexus.core.engine import NexusEngine
+
+    engine = NexusEngine()
+    client = MagicMock()
+    response = MagicMock()
+    response.status_code = 503
+    response.raise_for_status.side_effect = __import__("httpx").HTTPStatusError(
+        "unavailable", request=MagicMock(), response=MagicMock(status_code=503)
+    )
+    client.get = AsyncMock(return_value=response)
+    engine._get_client = AsyncMock(return_value=client)
+    with pytest.raises(RuntimeError, match="Cannot reconcile broker positions"):
+        await engine.get_positions()
+    await engine.close()
+
+
 def test_rust_risk_failure_is_unavailable_not_zero(monkeypatch):
     monkeypatch.setattr("nexus.utils.polyglot_bridge.shutil.which", lambda _: None)
     result = PolyglotBridge.calculate_risk_rust([0.01, -0.02, 0.005])
