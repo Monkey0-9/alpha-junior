@@ -43,10 +43,10 @@ graph TD
 ### Standard Setup
 
 ```bash
-# 1. Install dependencies
-pip install -r requirements.lock.txt
-# or use requirements.txt for a looser install constraint
-# pip install -r requirements.txt
+# 1. Install the portable core/test environment
+pip install -r requirements-ci.txt
+# For optional GPU, ONNX, and research integrations, select compatible
+# platform-specific wheels and review requirements.txt before installing.
 
 # 2. Configure credentials
 cp .env.example .env
