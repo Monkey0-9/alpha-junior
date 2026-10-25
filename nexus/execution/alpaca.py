@@ -383,16 +383,37 @@ class AlpacaClient:
             async with session.delete(
                 f"{self.base_url}/v2/orders/{order_id}", headers=self.headers
             ) as response:
-                if response.status in {200, 201}:
-                    return {"success": True, "order_id": order_id}
-                data = await response.json()
+                if response.status in {200, 201, 204}:
+                    return {"success": True, "order_id": order_id, "status": "CANCEL_REQUEST_ACCEPTED"}
+                if response.status == 404:
+                    # A 404 does not prove the order is cancelled; it might have
+                    # filled, expired, or been absent from this account.
+                    return {
+                        "success": False,
+                        "status": "ORDER_NOT_FOUND",
+                        "error": "Broker did not find the order; reconcile order and position state.",
+                        "reconciliation_required": True,
+                    }
+                try:
+                    data = await response.json()
+                except Exception:
+                    data = {"message": await response.text()}
                 return {
                     "success": False,
+                    "status": "CANCEL_REJECTED",
                     "error": data.get("message", "Unable to cancel order"),
                 }
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            logger.warning(f"Order cancel failed: {e}")
-            return {"success": False, "error": str(e)}
+            logger.error("Order cancellation outcome unknown for %s: %s", order_id, e)
+            self.enabled = False
+            self.simulated = False
+            return {
+                "success": False,
+                "status": "CANCEL_OUTCOME_UNKNOWN",
+                "error": "Cancellation outcome unknown; execution halted until broker state is reconciled.",
+                "reconciliation_required": True,
+                "trading_halted": True,
+            }
 
     async def get_assets(
         self,
