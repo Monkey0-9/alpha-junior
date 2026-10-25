@@ -320,19 +320,37 @@ class AlpacaClient:
                         "asset_class": asset_class,
                         "raw": data,
                     }
+                if response.status == 401:
+                    logger.critical("Alpaca order endpoint rejected credentials (401); disabling execution.")
+                    self.enabled = False
+                    return {
+                        "success": False,
+                        "status": "UNAUTHORIZED",
+                        "error": "Broker credentials rejected; execution disabled.",
+                        "asset_class": asset_class,
+                        "raw": data,
+                    }
                 logger.error(f"Alpaca order rejected: {response.status} {data}")
                 return {
                     "success": False,
+                    "status": "REJECTED",
                     "error": data.get("message", data),
                     "asset_class": asset_class,
                     "raw": data,
                 }
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            logger.error(f"Order submit failed: {e}")
+            # A timeout can occur after the broker accepted the POST. Do not
+            # represent this as a definite rejection or allow blind retries.
+            logger.critical("Order submission outcome unknown for %s: %s", symbol, e)
+            self.enabled = False
+            self.simulated = False
             return {
                 "success": False,
-                "error": str(e),
+                "status": "SUBMISSION_UNKNOWN",
+                "error": "Broker submission outcome is unknown. Trading is halted; reconcile open orders and positions before any retry.",
                 "asset_class": asset_class,
+                "reconciliation_required": True,
+                "trading_halted": True,
             }
 
     async def get_orders(
