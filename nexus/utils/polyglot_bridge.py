@@ -4,6 +4,8 @@ import platform
 import shutil
 import subprocess
 import logging
+import math
+import re
 from typing import Dict, Any, List, cast
 
 logger = logging.getLogger(__name__)
@@ -87,73 +89,88 @@ class PolyglotBridge:
             return {"overall_health": "UNKNOWN", "results": []}
 
     @staticmethod
-    def validate_order_zig(
-        order: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """Execute Zig Validator for order verification with fail-closed safety."""
-        strict_polyglot = os.getenv("NEXUS_STRICT_POLYGLOT", "false").lower() in ("true", "1", "yes")
+    def validate_order_zig(order: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate order structure in Python; optionally add the native Zig check.
 
-        # 1. Structural schema and bounds pre-validation (defense-in-depth)
-        qty = order.get("qty", 0)
-        price = order.get("price", 0.0)
-        symbol = order.get("symbol", "")
+        Python validation is the mandatory baseline and is not disabled when Zig
+        is missing. Set NEXUS_STRICT_POLYGLOT=true to require the native check too.
+        """
+        strict_polyglot = os.getenv("NEXUS_STRICT_POLYGLOT", "false").lower() in (
+            "true", "1", "yes"
+        )
+
+        symbol = order.get("symbol")
+        if not isinstance(symbol, str) or not re.fullmatch(r"[A-Z][A-Z0-9.-]{0,15}", symbol.strip().upper()):
+            return {"valid": False, "error": "Symbol has invalid format"}
+        if symbol != symbol.strip() or symbol != symbol.upper():
+            return {"valid": False, "error": "Symbol must be trimmed and uppercase"}
 
         try:
-            qty_val = float(qty)
-            if qty_val <= 0:
-                return {"valid": False, "error": "Quantity must be positive"}
-        except (ValueError, TypeError):
+            qty = float(order.get("qty", 0))
+        except (TypeError, ValueError):
             return {"valid": False, "error": "Invalid quantity specification"}
+        if not math.isfinite(qty) or qty <= 0:
+            return {"valid": False, "error": "Quantity must be finite and positive"}
 
         try:
-            price_val = float(price)
-            if price_val <= 0.0:
-                return {"valid": False, "error": "Price must be positive"}
-        except (ValueError, TypeError):
+            price = float(order.get("price", 0))
+        except (TypeError, ValueError):
             return {"valid": False, "error": "Invalid price specification"}
+        if not math.isfinite(price) or price <= 0:
+            return {"valid": False, "error": "Price must be finite and positive"}
 
-        if not symbol or not isinstance(symbol, str) or not symbol.strip():
-            return {"valid": False, "error": "Symbol must be non-empty string"}
+        side = order.get("side")
+        if side not in {"buy", "sell"}:
+            return {"valid": False, "error": "Side must be buy or sell"}
 
-        # 2. Native Zig verification
+        order_type = order.get("order_type", "market")
+        if order_type not in {"market", "limit", "stop", "stop_limit", "trailing_stop"}:
+            return {"valid": False, "error": "Unsupported order type"}
+
+        if order_type in {"limit", "stop_limit"}:
+            try:
+                limit_price = float(order.get("limit_price"))
+            except (TypeError, ValueError):
+                return {"valid": False, "error": "Limit orders require a valid limit_price"}
+            if not math.isfinite(limit_price) or limit_price <= 0:
+                return {"valid": False, "error": "limit_price must be finite and positive"}
+
+        if order_type in {"stop", "stop_limit"}:
+            try:
+                stop_price = float(order.get("stop_price"))
+            except (TypeError, ValueError):
+                return {"valid": False, "error": "Stop orders require a valid stop_price"}
+            if not math.isfinite(stop_price) or stop_price <= 0:
+                return {"valid": False, "error": "stop_price must be finite and positive"}
+
         if not shutil.which("zig"):
             if strict_polyglot:
-                logger.error("[PolyglotBridge] Strict mode: Zig compiler not found. Failing closed.")
-                return {
-                    "valid": False,
-                    "error": "ZIG_NOT_INSTALLED_FAIL_CLOSED",
-                }
-            return {
-                "valid": True,
-                "error": None,
-                "source": "FALLBACK_VERIFIED",
-            }
+                return {"valid": False, "error": "ZIG_NOT_INSTALLED_FAIL_CLOSED"}
+            return {"valid": True, "error": None, "source": "PYTHON_STRICT_VALIDATOR"}
 
         try:
-            input_data = json.dumps(order)
-            cmd = [
-                "zig",
-                "run",
-                "nexus/polyglot/zig_validator/main.zig",
-                "--",
-                input_data,
-            ]
+            input_data = json.dumps(order, allow_nan=False)
             result = subprocess.run(
-                cmd,
+                [
+                    "zig",
+                    "run",
+                    "nexus/polyglot/zig_validator/main.zig",
+                    "--",
+                    input_data,
+                ],
                 capture_output=True,
                 text=True,
                 check=True,
+                timeout=10,
             )
-            return cast(Dict[str, Any], json.loads(result.stdout))
+            native_result = cast(Dict[str, Any], json.loads(result.stdout))
+            if native_result.get("valid") is True:
+                return {**native_result, "source": "ZIG_AND_PYTHON"}
+            return {"valid": False, "error": native_result.get("error", "ZIG_VALIDATION_FAILED")}
         except Exception as exc:
-            logger.debug(f"Zig Validator execution error: {exc}")
+            logger.warning("Zig validator unavailable or failed: %s", exc)
             if strict_polyglot:
-                return {
-                    "valid": False,
-                    "error": f"VALIDATOR_OFFLINE_FAIL_CLOSED: {exc}",
-                }
-            return {
-                "valid": True,
-                "error": None,
-                "source": "FALLBACK_VERIFIED",
-            }
+                return {"valid": False, "error": f"VALIDATOR_OFFLINE_FAIL_CLOSED: {exc}"}
+            # The full Python schema above remains active as an independently
+            # enforced validator; no exception is treated as an automatic pass.
+            return {"valid": True, "error": None, "source": "PYTHON_STRICT_VALIDATOR_FALLBACK"}
