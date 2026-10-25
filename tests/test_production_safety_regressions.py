@@ -54,6 +54,14 @@ async def test_liveness_endpoint_is_public(monkeypatch):
     assert response.status_code == 200
 
 
+def test_rust_risk_failure_is_unavailable_not_zero(monkeypatch):
+    monkeypatch.setattr("nexus.utils.polyglot_bridge.shutil.which", lambda _: None)
+    result = PolyglotBridge.calculate_risk_rust([0.01, -0.02, 0.005])
+    assert result["status"] == "RUST_NOT_INSTALLED"
+    assert result["var"] is None
+    assert result["expected_shortfall"] is None
+
+
 def test_order_validator_rejects_non_finite_or_invalid_values(monkeypatch):
     monkeypatch.delenv("NEXUS_STRICT_POLYGLOT", raising=False)
     invalid_orders = [
