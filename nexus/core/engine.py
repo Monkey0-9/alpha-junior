@@ -229,27 +229,50 @@ class NexusEngine:
         return self.universe_manager.is_valid_symbol(symbol)
 
     async def get_account_state(self) -> Dict[str, Any]:
+        """Return verified broker account state; unknown is not fallback equity."""
         client = await self._get_client()
         try:
             response = await client.get(f"{self.backend_url}/api/alpaca/account")
-            if response.status_code == 200:
-                return cast(Dict[str, Any], response.json())
+            response.raise_for_status()
+            account = cast(Dict[str, Any], response.json())
+            if not isinstance(account, dict) or account.get("simulated"):
+                raise RuntimeError("Broker account response is invalid or simulated.")
+            status = str(account.get("status", "")).upper()
+            if status != "ACTIVE":
+                raise RuntimeError(f"Broker account is not ACTIVE (status={status or 'UNKNOWN'}).")
+            equity_raw = account.get("equity", account.get("portfolio_value"))
+            last_equity_raw = account.get("last_equity", equity_raw)
+            if equity_raw is None or last_equity_raw is None:
+                raise RuntimeError("Broker account response is missing equity values.")
+            equity = float(equity_raw)
+            last_equity = float(last_equity_raw)
+            if not np.isfinite(equity) or equity <= 0 or not np.isfinite(last_equity) or last_equity <= 0:
+                raise RuntimeError("Broker account response contains invalid equity values.")
+            return account
         except Exception as exc:
-            logger.warning(f"Account fetch failure: {exc}")
-        return {
-            "equity": self.portfolio_value,
-            "last_equity": self.portfolio_value,
-        }
+            logger.error("Account fetch failure; trading state is unknown: %s", exc)
+            raise RuntimeError("Cannot verify broker account state; trading cycle aborted.") from exc
 
     async def get_positions(self) -> List[Dict[str, Any]]:
+        """Return broker-reconciled positions; never convert read errors to empty."""
         client = await self._get_client()
         try:
             response = await client.get(f"{self.backend_url}/api/alpaca/positions")
-            if response.status_code == 200:
-                return cast(List[Dict[str, Any]], response.json().get("positions", []))
+            response.raise_for_status()
+            payload = cast(Dict[str, Any], response.json())
+            positions = payload.get("positions")
+            if not isinstance(positions, list):
+                raise RuntimeError("Broker positions response is missing a positions list.")
+            for item in positions:
+                if not isinstance(item, dict) or not item.get("symbol") or item.get("qty") is None:
+                    raise RuntimeError("Broker positions response contains malformed position data.")
+                quantity = float(item["qty"])
+                if not np.isfinite(quantity):
+                    raise RuntimeError("Broker positions response contains non-finite quantity.")
+            return cast(List[Dict[str, Any]], positions)
         except Exception as exc:
-            logger.warning(f"Position fetch failure: {exc}")
-        return []
+            logger.error("Position fetch failure; refusing to assume an empty portfolio: %s", exc)
+            raise RuntimeError("Cannot reconcile broker positions; trading cycle aborted.") from exc
 
     async def fetch_universe_history(
         self, symbols: List[str], timeframe: str = "1D", limit: int = 80
