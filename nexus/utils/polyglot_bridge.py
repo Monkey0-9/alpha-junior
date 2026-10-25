@@ -15,7 +15,6 @@ class PolyglotBridge:
     """Cross-platform bridge for high-performance satellite engines."""
 
     @staticmethod
-    @staticmethod
     def calculate_risk_rust(
         returns: List[float],
         conf: float = 0.95,
