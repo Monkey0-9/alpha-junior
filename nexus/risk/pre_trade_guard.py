@@ -119,7 +119,11 @@ class PreTradeRiskGuard:
             "qty": qty,
             "side": side,
             "price": float(price),
-            "order_type": order_request.get("order_type", "market"),
+            "order_type": order_type,
+            "limit_price": order_request.get("limit_price"),
+            "stop_price": order_request.get("stop_price"),
+            "trail_price": order_request.get("trail_price"),
+            "trail_percent": order_request.get("trail_percent"),
             "strategy": order_request.get("strategy", "manual"),
         }
 
