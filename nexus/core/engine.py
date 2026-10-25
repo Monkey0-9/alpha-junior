@@ -382,21 +382,34 @@ class NexusEngine:
         benchmark_data = await self.alpha_engine.fetch_market_data(
             "SPY", timeframe="1D", limit=120
         )
+        if benchmark_data.empty or "close" not in benchmark_data.columns:
+            logger.error("Benchmark market data is unavailable; skipping new risk-increasing orders.")
+            self.health_monitor.record(
+                "market", False, details="Benchmark data unavailable; new orders blocked"
+            )
+            self.health_monitor.heartbeat()
+            return
 
-        if not benchmark_data.empty:
-            try:
-                self.market_regime = self.regime_detector.detect(benchmark_data)
-                regime_probs = self.regime_detector.get_regime_probabilities()
-            except Exception as e:
-                logger.warning(f"Regime detection failed: {e}")
-                self.market_regime = "SIDEWAYS"
-                regime_probs = {
-                    "BULL": 0.25,
-                    "BEAR": 0.25,
-                    "SIDEWAYS": 0.25,
-                    "TURBULENT": 0.25,
-                }
-        else:
+        benchmark_close = pd.to_numeric(benchmark_data["close"], errors="coerce")
+        returns_series = benchmark_close.pct_change(fill_method=None)
+        returns_series = returns_series.replace([np.inf, -np.inf], np.nan).dropna()
+        returns_list = returns_series.to_numpy(dtype=float)
+        if returns_list.size < 20 or not np.isfinite(returns_list).all():
+            logger.error(
+                "Benchmark return sample is insufficient or invalid (%d observations); skipping new risk-increasing orders.",
+                returns_list.size,
+            )
+            self.health_monitor.record(
+                "market", False, details="Insufficient/invalid benchmark returns; new orders blocked"
+            )
+            self.health_monitor.heartbeat()
+            return
+
+        try:
+            self.market_regime = self.regime_detector.detect(benchmark_data)
+            regime_probs = self.regime_detector.get_regime_probabilities()
+        except Exception as e:
+            logger.warning(f"Regime detection failed: {e}")
             self.market_regime = "SIDEWAYS"
             regime_probs = {
                 "BULL": 0.25,
@@ -440,11 +453,6 @@ class NexusEngine:
             historical_data=history,
         )
 
-        returns_list = (
-            benchmark_data["close"].pct_change().dropna().to_numpy()
-            if not benchmark_data.empty
-            else np.array([])
-        )
         risk_metrics = {
             "var": 0.0,
             "cvar": 0.0,
