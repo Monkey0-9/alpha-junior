@@ -124,6 +124,40 @@ def test_order_validator_rejects_non_finite_or_invalid_values(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_guard_refreshes_live_positions_even_with_precomputed_state():
+    from unittest.mock import AsyncMock, MagicMock
+    from nexus.risk.pre_trade_guard import PreTradeRiskGuard
+
+    guard = PreTradeRiskGuard(governance=MagicMock())
+    client = MagicMock()
+    client.enabled = True
+    client.simulated = False
+    client.get_bars = AsyncMock(return_value=[{
+        "t": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+        "close": 100.0,
+    }])
+    client.get_account = AsyncMock(return_value={
+        "enabled": True, "simulated": False, "status": "ACTIVE",
+        "equity": 10000.0, "last_equity": 10000.0,
+    })
+    client.get_positions = AsyncMock(return_value=[{
+        "symbol": "AAPL", "qty": "90", "market_value": "9000",
+    }])
+    client.submit_order = AsyncMock(return_value={"success": True, "order_id": "must-not-submit"})
+    supplied_state = {"total_value": 10000.0, "drawdown": 0.0, "positions": []}
+
+    result = await guard.validate_and_submit(
+        client,
+        {"symbol": "AAPL", "qty": 20, "side": "buy", "price": 100.0, "order_type": "market"},
+        portfolio_state=supplied_state,
+    )
+
+    assert result.get("status") == "rejected"
+    client.get_positions.assert_awaited_once()
+    client.submit_order.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_order_submission_timeout_marks_state_unknown_and_disables_client():
     from unittest.mock import MagicMock, AsyncMock
     import aiohttp
