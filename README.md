@@ -1,6 +1,8 @@
-# Nexus Hardened Institutional Quantitative Platform (v2.0)
+# Alpha-Junior / Nexus Quantitative Research and Paper-Trading Platform
 
-Nexus is a production-grade, 24/7 autonomous trading intelligence platform. Version 2.0 introduces industrial-grade security, persistent audit trails, and deterministic quantitative modeling.
+> **Release status: NOT PRODUCTION CERTIFIED.** This repository contains research, paper-trading and execution components, but passing unit tests or starting the services is not proof of live-trading readiness. Before enabling live automation, complete the checklist in [docs/ALPHA_JUNIOR_HARDENING_PLAN.md](docs/ALPHA_JUNIOR_HARDENING_PLAN.md). No return, accuracy, prediction-rate or uptime guarantee is made.
+
+Nexus is an evolving quantitative research and execution platform. Security hardening, broker lifecycle verification, data provenance, model validation and operational certification remain separate release gates.
 
 ## 🏛 Architecture
 
@@ -23,12 +25,12 @@ graph TD
 
 ## 🛡️ Hardening Features (v2.0)
 
-- **API Security**: Authentication middleware on all mutation endpoints using `X-API-Key`.
-- **CORS Lock**: Restricted browser access to the Streamlit origin only.
-- **Persistence**: All governance audits and trade history are persisted to `data/nexus_audit.db`.
-- **Deterministic AI**: Removed random confidence stubs; replaced with Ensemble Strategy Agreement.
-- **Real Monte Carlo**: Active path simulation for survival analysis and ruin probability.
-- **Cross-Platform**: Full support for Windows, Linux, and macOS (Polyglot portability fixed).
+- **API Security**: Private read and mutation routes require a configured X-API-Key; missing/placeholder keys fail closed. Liveness endpoints are the only unauthenticated routes.
+- **CORS**: Browser-origin policy is configured, but CORS is not a substitute for authentication or network controls.
+- **Persistence**: SQLite audit and trade-history tables exist. Durable audit-failure gating and backup/restore certification remain release blockers.
+- **Signals and models**: Outputs are research signals, not calibrated probabilities; they require leakage-safe out-of-sample validation before promotion.
+- **Monte Carlo**: A survival simulation path exists; its assumptions and estimates must be independently validated before risk decisions rely on it.
+- **Polyglot components**: Native code is optional/target-dependent and must pass reproducible build and parity tests on each supported operating system.
 
 ## 🚀 Deployment
 
@@ -100,7 +102,7 @@ print(result)
 ## 🛡 Verification & Quality
 
 ```bash
-# Run the 27-point comprehensive audit
+# Run the grouped readiness verification (currently eight top-level checks)
 python verify_production_ready.py
 
 # Run the test suite
@@ -110,4 +112,6 @@ pytest tests/
 ---
 > Performance claims should be validated with audited historical and live track records. This platform targets superior risk-adjusted returns but does not promise any specific annualized performance.
 
-**Status:** `PRODUCTION_PREPARED` | **Version:** `2.0.0` | **Security:** `HARDENED`
+**Status:** `NOT_PRODUCTION_CERTIFIED` | **Version:** `2.0.0` | **NCM:** research plan only ([docs/NCM_RESEARCH_PLAN.md](docs/NCM_RESEARCH_PLAN.md))
+
+Use paper/simulation mode until all release gates have passed on the exact commit and deployed environment. Simulation, synthetic prices, a green unit-test result or a backtest is not evidence of live-broker readiness or profitable trading.
