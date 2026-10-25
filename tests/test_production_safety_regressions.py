@@ -69,6 +69,35 @@ def test_order_validator_rejects_non_finite_or_invalid_values(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_order_submission_timeout_marks_state_unknown_and_disables_client():
+    from unittest.mock import MagicMock, AsyncMock
+    import aiohttp
+    from nexus.execution.alpaca import AlpacaClient, AlpacaCredentials
+
+    class BrokenPost:
+        async def __aenter__(self):
+            raise aiohttp.ClientError("connection dropped after request write")
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    client = AlpacaClient(
+        credentials=AlpacaCredentials(api_key="test", api_secret="test")
+    )
+    client.simulated = False
+    mock_session = MagicMock()
+    mock_session.post.return_value = BrokenPost()
+    client._get_session = AsyncMock(return_value=mock_session)
+
+    result = await client.submit_order("AAPL", 1, "buy")
+    assert result["status"] == "SUBMISSION_UNKNOWN"
+    assert result["reconciliation_required"] is True
+    assert result["trading_halted"] is True
+    assert client.enabled is False
+    assert client.simulated is False
+
+
+@pytest.mark.asyncio
 async def test_guard_rejects_unverified_account_state_without_submission(monkeypatch):
     monkeypatch.setattr("nexus.utils.config.Config.ALLOW_SIMULATION_FALLBACK", False)
     from nexus.risk.pre_trade_guard import PreTradeRiskGuard
