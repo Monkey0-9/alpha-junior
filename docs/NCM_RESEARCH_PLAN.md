@@ -1,6 +1,6 @@
 # Neural Causal Models (NCM): research and promotion plan
 
-**Status: research design only. This document does not claim that an NCM implementation is currently integrated or that an NCM improves trading performance.**
+**Status: an isolated research prototype exists under `nexus/research/ncm/`. It is not integrated with the Alpha-Junior ensemble or execution path, and no claim is made that it improves trading performance.**
 
 ## Meaning and scope
 
@@ -19,7 +19,7 @@ NCM is not synonymous with a generic neural network, and causal-looking outputs 
 
 1. **Point-in-time data contract.** Every feature needs source, event time, publication/availability time, ingestion time, adjustment/version metadata, timezone, and missingness status. No feature may be available to a prediction before it would have been available in production.
 2. **Causal graph registry.** Version each candidate graph, parent set, lag convention, domain assumptions, and identification rationale. For time series, unroll temporal dependencies into lagged nodes; prohibit same-timestamp leakage and cyclic causal graphs.
-3. **Mechanism learner.** Fit one conditional neural mechanism per graph node, with explicit exogenous-noise inputs. Separate train, tune, calibration, and final-test periods chronologically. Keep graph learning and mechanism learning artifacts reproducible.
+3. **Mechanism learner.** The current prototype fits a conditional MLP mechanism for each non-root graph node and uses residual bootstrap for simulation. It accepts a declared graph; it does not discover causal structure or prove identifiability. Upgrade it only with explicit exogenous-noise mechanisms, separate train/tune/calibration/final-test periods, and reproducible artifacts.
 4. **Forecast interface.** Emit a distribution or calibrated quantiles for returns/risk over fixed horizons—not an uncalibrated "confidence" percentage. Each prediction includes model version, feature timestamp, data-quality flags, horizon, regime, and reason codes.
 5. **Counterfactual interface.** Support named, bounded scenario interventions such as volatility or sector shocks. Mark assumptions and uncertainty; never label a generated counterfactual as an observed market fact.
 6. **Decision boundary.** NCM produces an advisory forecast only. A separate portfolio/risk layer combines it with existing signals, costs, risk budgets, liquidity, current holdings, broker status, and kill-switch state. Any missing/invalid/stale input maps to NO_TRADE.
@@ -68,9 +68,9 @@ A failure at any gate means **do not promote**. Do not imply an expected improve
 
 ## Implementation sequence
 
-1. Repair source provenance, point-in-time timestamps, data quality and leakage tests.
+1. Repair source provenance, point-in-time timestamps, data quality and leakage tests before using the prototype on market data.
 2. Freeze a baseline dataset/feature contract and repeatable walk-forward harness.
-3. Implement the graph registry and one minimal NCM research runner in an isolated optional dependency environment.
+3. Extend the current research prototype with graph/version registry, configurable experiment manifests, and isolated execution while preserving its no-trade/no-promotion boundary.
 4. Add baseline and negative-control experiments before complexity tuning.
 5. Persist artifacts and signed evaluation manifests in the model registry.
 6. Add shadow-only inference and monitoring for calibration drift, covariate shift, missing data and latency.
