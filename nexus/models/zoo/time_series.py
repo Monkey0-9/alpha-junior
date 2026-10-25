@@ -5,10 +5,6 @@ from typing import Dict, Tuple, Any
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.preprocessing import StandardScaler
 
-torch: Any = None
-nn: Any = None
-optim: Any = None
-
 try:
     import torch
     import torch.nn as nn
@@ -16,6 +12,10 @@ try:
 
     TORCH_AVAILABLE = True
 except ImportError:
+    # Keep optional torch names defined without redeclaring successful imports.
+    torch = None
+    nn = None
+    optim = None
     TORCH_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
