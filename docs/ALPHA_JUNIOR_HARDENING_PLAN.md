@@ -26,6 +26,12 @@
 6. **Risk model correctness:** independently verify Kelly math, portfolio constraints after every transformation, drawdown denominators, return-frequency annualization, VaR/ES, concentration, gross/net exposures, shorting and portfolio-level risk. Every native/Python fallback must preserve identical validation semantics.
 7. **Security and deployment:** rotate secrets, validate strong configuration, enforce TLS/private network boundaries, least-privilege service accounts, protected branches/reviews, dependency and container scanning, and safe permission defaults. Verify CORS is not mistaken for API authentication.
 
+### P0 — model lifecycle and quant validation
+
+- **Unfitted-model side effects:** current ensemble/time-series interfaces include prediction paths that attempt to fit on supplied frames or return fallback probability maps when fitting is unavailable. Refactor serving to load an explicitly trained, versioned artifact; prediction must not trigger training, and a failure must return a typed unavailable/no-trade state rather than fabricated calibrated probabilities.
+- **Prediction/target alignment:** verify every target horizon and feature timestamp by contract; train/test separation must be temporal and account for overlapping labels. Do not interpret accuracy on an in-sample or shuffled frame as forecasting skill.
+- **Production model registration:** register every ensemble model with name, immutable artifact hash, feature schema, calibration report and rollback target. Reject unknown, untrained, stale or schema-incompatible models at load time. The NCM prototype remains outside this registry until it passes these controls.
+
 ### P1 — model and operations
 
 - Implement the separate NCM research track described in NCM_RESEARCH_PLAN.md; it is not live-trading code yet.
