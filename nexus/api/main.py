@@ -67,7 +67,13 @@ async def api_key_auth(
         return await call_next(request)
 
     expected_key = os.getenv("NEXUS_API_KEY", "").strip()
-    if not expected_key:
+    placeholder_keys = {
+        "changeme",
+        "your_api_key",
+        "your_secure_api_key",
+        "generate_a_secure_random_key_for_internal_auth",
+    }
+    if not expected_key or expected_key.lower() in placeholder_keys:
         return JSONResponse(
             status_code=503,
             content={"detail": "API authentication is not configured; set NEXUS_API_KEY."},
