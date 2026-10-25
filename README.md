@@ -99,6 +99,10 @@ result = db.query("SELECT symbol, count(*) FROM market_data GROUP BY symbol").df
 print(result)
 ```
 
+## 🧠 NCM research prototype
+
+A Neural Causal Model research prototype is available at `nexus/research/ncm/`. It accepts an explicit acyclic graph, fits neural mechanisms, supports reproducible interventions, and evaluates a chronological holdout against a mean baseline. It is **offline research only**: it is not connected to the trading ensemble, has no proven prediction advantage, and cannot promote itself or submit orders. See [docs/NCM_RESEARCH_PLAN.md](docs/NCM_RESEARCH_PLAN.md) for the required evidence gates.
+
 ## 🛡 Verification & Quality
 
 ```bash
