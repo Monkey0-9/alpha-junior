@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Depends
-from typing import Optional, Dict, Any
-from pydantic import BaseModel
+from typing import Optional, Dict, Any, Literal
+from pydantic import BaseModel, Field
 import logging
 from nexus.execution.alpaca import get_client, AlpacaClient
 from nexus.utils.config import Config
@@ -12,18 +12,18 @@ router = APIRouter(prefix="/api/alpaca", tags=["execution"])
 
 
 class OrderRequest(BaseModel):
-    symbol: str
-    qty: float
-    side: str
-    asset_class: str = "equity"
-    strategy: Optional[str] = None
-    order_type: str = "market"
-    time_in_force: str = "day"
-    limit_price: Optional[float] = None
-    stop_price: Optional[float] = None
-    trail_price: Optional[float] = None
-    trail_percent: Optional[float] = None
-    client_order_id: Optional[str] = None
+    symbol: str = Field(min_length=1, max_length=16)
+    qty: float = Field(gt=0, allow_inf_nan=False)
+    side: Literal["buy", "sell"]
+    asset_class: Literal["equity"] = "equity"
+    strategy: Optional[str] = Field(default=None, max_length=100)
+    order_type: Literal["market", "limit", "stop", "stop_limit", "trailing_stop"] = "market"
+    time_in_force: Literal["day", "gtc", "opg", "cls", "ioc", "fok"] = "day"
+    limit_price: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
+    stop_price: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
+    trail_price: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
+    trail_percent: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
+    client_order_id: Optional[str] = Field(default=None, max_length=32)
     extended_hours: bool = False
 
 
