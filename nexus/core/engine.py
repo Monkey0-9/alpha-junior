@@ -454,10 +454,17 @@ class NexusEngine:
         if returns_list.size > 0:
             rust_risk = PolyglotBridge.calculate_risk_rust(returns_list.tolist())
             risk_metrics = self.risk_engine.assess_risk(returns_list)
-            # Preserve unavailable/error status; zero VaR would falsely imply no risk.
-            risk_metrics["rust_var"] = rust_risk.get("var")
-            risk_metrics["rust_expected_shortfall"] = rust_risk.get("expected_shortfall")
-            risk_metrics["rust_risk_status"] = rust_risk.get("status", "UNKNOWN")
+            if rust_risk.get("status") == "OK":
+                risk_metrics["rust_var"] = float(rust_risk["var"])
+                risk_metrics["rust_expected_shortfall"] = float(
+                    rust_risk["expected_shortfall"]
+                )
+            else:
+                # Omit unavailable native numbers rather than recording fake zero risk.
+                logger.warning(
+                    "Rust risk metrics unavailable (status=%s); using the separately calculated Python risk assessment.",
+                    rust_risk.get("status", "UNKNOWN"),
+                )
 
         multiplier = self.determine_risk_scale(
             {"regime_probabilities": regime_probs}, risk_metrics
