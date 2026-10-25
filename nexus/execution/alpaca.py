@@ -142,21 +142,15 @@ class AlpacaClient:
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     }
                 if response.status == 401:
-                    logger.error(
-                        "Alpaca API Keys invalid (401). Rejecting connection - silent simulation fallback disabled for safety."
-                    )
-                    if Config.ALLOW_SIMULATION_FALLBACK:
-                        logger.warning(
-                            "Simulation fallback explicitly permitted by NEXUS_ALLOW_SIMULATION_FALLBACK."
-                        )
-                        self.simulated = True
-                        return await self.get_account()
+                    # Invalid broker credentials must never change execution mode.
+                    # Simulation can only be selected at initialization, explicitly.
+                    logger.error("Alpaca API credentials rejected (401); disabling broker execution.")
                     self.enabled = False
                     return {
                         "enabled": False,
                         "simulated": False,
                         "status": "UNAUTHORIZED",
-                        "error": "Alpaca API credentials invalid (401). Live execution disabled.",
+                        "error": "Alpaca API credentials invalid (401). Execution disabled; fix credentials explicitly.",
                     }
                 return {
                     "enabled": True,
@@ -208,10 +202,12 @@ class AlpacaClient:
                         }
                         for p in positions
                     ]
-                return []
+                raise RuntimeError(
+                    f"Unable to establish live position state (HTTP {response.status}); refusing to treat it as an empty portfolio."
+                )
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logger.warning(f"Failed to fetch Alpaca positions: {e}")
-            return []
+            raise RuntimeError("Unable to establish live position state; pre-trade checks must fail closed.") from e
 
     async def submit_order(
         self,
@@ -355,10 +351,10 @@ class AlpacaClient:
             ) as response:
                 if response.status in {200, 201}:
                     return cast(List[Dict[str, Any]], await response.json())
-                return []
+                raise RuntimeError(f"Unable to reconcile live orders (HTTP {response.status}).")
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logger.warning(f"Failed to fetch Alpaca orders: {e}")
-            return []
+            raise RuntimeError("Unable to reconcile live orders; broker state is unknown.") from e
 
     async def cancel_order(self, order_id: str) -> Dict[str, Any]:
         if self.simulated:
@@ -537,13 +533,11 @@ class AlpacaClient:
                                 )
                                 break
                             if response.status == 401:
-                                logger.warning(
-                                    "Alpaca API Keys invalid (401). Falling back to full simulation mode."
+                                logger.error(
+                                    "Alpaca market-data credentials rejected (401); refusing synthetic-data substitution."
                                 )
-                                self.simulated = True
-                                return await self.get_bars(
-                                    symbol, timeframe, limit, start, feed
-                                )
+                                self.enabled = False
+                                return []
                             logger.warning(
                                 f"Alpaca bars request for {symbol} returned HTTP {response.status}: {await response.text()}"
                             )
