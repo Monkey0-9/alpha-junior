@@ -184,37 +184,81 @@ class PreTradeRiskGuard:
         }
 
         # 3. Retrieve or construct current portfolio state
-        if portfolio_state is None:
+        # Live account and position state are always re-read at the mandatory
+        # order boundary. A caller-supplied snapshot is advisory only and cannot
+        # be the authority for current concentration/exposure checks.
+        if not client.simulated:
             try:
+                if not client.enabled:
+                    raise RuntimeError("Live broker execution is disabled.")
                 acc = await client.get_account()
-                if not client.simulated:
-                    if not client.enabled or acc.get("status") != "ACTIVE" or acc.get("simulated"):
-                        return {
-                            "success": False,
-                            "status": "rejected",
-                            "error": "Broker account state is not verified ACTIVE; pre-trade checks fail closed.",
-                        }
+                if (
+                    acc.get("status") != "ACTIVE"
+                    or acc.get("simulated")
+                    or not acc.get("enabled", True)
+                ):
+                    raise RuntimeError("Broker account is not verified ACTIVE live state.")
                 equity_raw = acc.get("equity", acc.get("portfolio_value"))
                 last_equity_raw = acc.get("last_equity", equity_raw)
                 if equity_raw is None or last_equity_raw is None:
                     raise ValueError("Broker omitted equity values.")
                 equity = float(equity_raw)
                 last_equity = float(last_equity_raw)
-                if not math.isfinite(equity) or equity <= 0 or not math.isfinite(last_equity) or last_equity <= 0:
+                if (
+                    not math.isfinite(equity)
+                    or equity <= 0
+                    or not math.isfinite(last_equity)
+                    or last_equity <= 0
+                ):
                     raise ValueError("Broker returned invalid equity values.")
-                dd = max(0.0, (last_equity - equity) / last_equity)
                 positions = await client.get_positions()
-                portfolio_state = {
+                dd = max(0.0, (last_equity - equity) / last_equity)
+                verified_state = {
                     "total_value": equity,
                     "drawdown": dd,
                     "positions": positions,
                 }
-            except Exception as e:
-                logger.error("Unable to establish verified portfolio state; rejecting order: %s", e)
+                if portfolio_state is not None:
+                    supplied_equity = float(portfolio_state.get("total_value", 0.0))
+                    # Reject material changes between the engine's snapshot and
+                    # the authoritative broker read rather than sizing on stale data.
+                    if (
+                        not math.isfinite(supplied_equity)
+                        or supplied_equity <= 0
+                        or abs(supplied_equity - equity) / equity > 0.01
+                    ):
+                        raise RuntimeError("Precomputed equity snapshot differs from verified broker equity by more than 1%.")
+                portfolio_state = verified_state
+            except Exception as exc:
+                logger.critical("Unable to verify live broker state at order boundary: %s", exc)
                 return {
                     "success": False,
                     "status": "rejected",
-                    "error": "Unable to verify broker account and positions; order rejected.",
+                    "error": "Unable to verify current live account and positions; order rejected.",
+                }
+        elif portfolio_state is None:
+            try:
+                acc = await client.get_account()
+                equity_raw = acc.get("equity", acc.get("portfolio_value"))
+                last_equity_raw = acc.get("last_equity", equity_raw)
+                if equity_raw is None or last_equity_raw is None:
+                    raise ValueError("Simulation account omitted equity values.")
+                equity = float(equity_raw)
+                last_equity = float(last_equity_raw)
+                if not math.isfinite(equity) or equity <= 0 or not math.isfinite(last_equity) or last_equity <= 0:
+                    raise ValueError("Simulation account returned invalid equity values.")
+                positions = await client.get_positions()
+                portfolio_state = {
+                    "total_value": equity,
+                    "drawdown": max(0.0, (last_equity - equity) / last_equity),
+                    "positions": positions,
+                }
+            except Exception as exc:
+                logger.error("Unable to establish simulation account state; rejecting order: %s", exc)
+                return {
+                    "success": False,
+                    "status": "rejected",
+                    "error": "Unable to verify simulation account and positions; order rejected.",
                 }
 
         try:
