@@ -60,7 +60,7 @@ public:
         double take_profit = 0.12,
         int min_hold = 2)
     {
-        BacktestResult result;
+        BacktestResult result{};
         int n = std::min(signals.size(), bars.size());
         if (n < 10) return result;
 
@@ -181,7 +181,7 @@ public:
         double position_size = 0.25)
     {
         int n = std::min(signals.size(), bars.size());
-        BacktestResult result;
+        BacktestResult result{};
         if (n < train_window + test_window) return result;
 
         std::vector<double> all_signals(n, 0.0);
