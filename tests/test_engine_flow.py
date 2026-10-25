@@ -59,6 +59,39 @@ async def test_engine_no_trade_state() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.filterwarnings("ignore::RuntimeWarning")
+async def test_engine_blocks_new_orders_when_benchmark_data_missing() -> None:
+    """Missing benchmark returns must not be treated as zero-risk evidence."""
+    engine = NexusEngine()
+    engine.symbols = ["AAPL"]
+    history = pd.DataFrame({
+        "open": np.linspace(100, 120, 50),
+        "high": np.linspace(102, 122, 50),
+        "low": np.linspace(98, 118, 50),
+        "close": np.linspace(101, 121, 50),
+        "volume": np.linspace(1000, 2000, 50),
+    })
+    engine.fetch_universe_history = AsyncMock(return_value={"AAPL": history})
+    engine.alpha_engine.get_batch_signals = AsyncMock(return_value={"AAPL": 0.9})
+    engine.alpha_engine.fetch_market_data = AsyncMock(return_value=pd.DataFrame())
+    engine.manage_positions = AsyncMock()
+    engine.get_positions = AsyncMock(return_value=[])
+    engine.get_account_state = AsyncMock(return_value={"equity": 10000, "buying_power": 10000})
+    engine.refresh_universe = AsyncMock()
+
+    mock_client = AsyncMock()
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {"is_open": True}
+    mock_client.get.return_value = mock_response
+
+    with patch.object(engine, "_get_client", return_value=mock_client):
+        with patch.object(engine, "_submit_trade", new_callable=AsyncMock) as mock_submit:
+            await engine.run_cycle()
+            mock_submit.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.filterwarnings("ignore::RuntimeWarning")
 async def test_engine_crisis_correlation() -> None:
     """Verify that during a turbulent regime, sizes are cut and no new extreme trades happen."""
     engine = NexusEngine()
