@@ -141,22 +141,24 @@ class ProductionVerifier:
                     self.results["security_hardening"] = False
                     return False
 
-                # Without a real key the service must fail closed, not run open.
+                # Fail-closed is a security property, but missing/weak credentials
+                # still means the deployment is NOT production-ready.
                 if not configured_key:
-                    logger.info("  [OK] Missing/placeholder key fails closed with HTTP 503")
-                    self.results["security_hardening"] = True
-                    return True
+                    logger.error(
+                        "  [FAIL] Private route is safely closed with HTTP 503, but a strong NEXUS_API_KEY is required for readiness."
+                    )
+                    self.results["security_hardening"] = False
+                    return False
 
-                # A supplied key must reach request-body validation; malformed body
-                # should produce 422 and never cause an execution submission.
-                authorized_resp = await client.post(
-                    "/api/alpaca/order",
-                    json={},
+                # Use OpenAPI as a broker-independent private read to verify that a
+                # correct key passes middleware; avoid probing an order endpoint.
+                authorized_resp = await client.get(
+                    "/openapi.json",
                     headers={"X-API-Key": configured_key},
                 )
-                if authorized_resp.status_code != 422:
+                if authorized_resp.status_code != 200:
                     logger.error(
-                        "  [FAIL] Authorized malformed order returned %s, expected 422",
+                        "  [FAIL] Correct API key did not authorize OpenAPI read: HTTP %s",
                         authorized_resp.status_code
                     )
                     self.results["security_hardening"] = False
