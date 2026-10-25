@@ -5,15 +5,13 @@ from contextlib import asynccontextmanager
 from typing import Dict, AsyncGenerator, Callable, Awaitable, Any
 import logging
 import os
+import hmac
 from nexus.api.alpaca_router import router as alpaca_router
 from nexus.api.monitor_router import router as monitor_router
 from nexus.execution.alpaca import get_client
 from nexus.utils.config import Config
 
 logger = logging.getLogger(__name__)
-
-# API key loaded once at import time
-_API_KEY = os.getenv("NEXUS_API_KEY", "")
 
 
 @asynccontextmanager
@@ -55,31 +53,34 @@ app = FastAPI(
 )
 
 
-# --- API Key Authentication Middleware ---
+# --- Fail-closed API authentication middleware ---
 @app.middleware("http")
 async def api_key_auth(
     request: Request, call_next: Callable[[Request], Awaitable[Any]]
 ) -> Any:
-    """Verify X-API-Key header on mutation endpoints."""
-    # Skip auth for health checks and GET-only read endpoints
-    logger.info(f"API Request: {request.method} {request.url.path}")
-    safe_paths = {"/docs", "/openapi.json", "/api/alpaca/health"}
-    if request.url.path in safe_paths:
-        logger.info(f"Safe path detected: {request.url.path}")
+    """Authenticate every non-health route; never treat an unset key as dev access."""
+    logger.info("API Request: %s %s", request.method, request.url.path)
+
+    # Liveness-only endpoints expose no account, portfolio, signal, or execution data.
+    safe_paths = {"/api/health", "/api/alpaca/health", "/api/monitor/health"}
+    if request.method == "OPTIONS" or request.url.path in safe_paths:
         return await call_next(request)
 
-    # If no API key is configured, skip auth (dev mode)
-    if not _API_KEY:
-        return await call_next(request)
+    expected_key = os.getenv("NEXUS_API_KEY", "").strip()
+    if not expected_key:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "API authentication is not configured; set NEXUS_API_KEY."},
+        )
 
-    # Enforce auth on POST, DELETE, PUT, PATCH
-    if request.method in {"POST", "DELETE", "PUT", "PATCH"}:
-        provided_key = request.headers.get("X-API-Key", "")
-        if provided_key != _API_KEY:
-            return JSONResponse(
-                status_code=401,
-                content={"detail": "Invalid or missing API key"},
-            )
+    provided_key = request.headers.get("X-API-Key", "")
+    if not provided_key or not hmac.compare_digest(
+        provided_key.encode("utf-8"), expected_key.encode("utf-8")
+    ):
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Invalid or missing API key"},
+        )
 
     return await call_next(request)
 
@@ -134,6 +135,7 @@ async def health() -> Dict[str, Any]:
             overall_status = "degraded"
         elif client.simulated:
             checks["broker"] = "simulated"
+            overall_status = "degraded"
         else:
             acc = await client.get_account()
             if acc.get("status") in {"ACTIVE", "healthy"}:
