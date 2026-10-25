@@ -128,16 +128,22 @@ class PolyglotBridge:
             return {"valid": False, "error": "Unsupported order type"}
 
         if order_type in {"limit", "stop_limit"}:
+            raw_limit_price = order.get("limit_price")
+            if raw_limit_price is None:
+                return {"valid": False, "error": "Limit orders require a valid limit_price"}
             try:
-                limit_price = float(order.get("limit_price"))
+                limit_price = float(raw_limit_price)
             except (TypeError, ValueError):
                 return {"valid": False, "error": "Limit orders require a valid limit_price"}
             if not math.isfinite(limit_price) or limit_price <= 0:
                 return {"valid": False, "error": "limit_price must be finite and positive"}
 
         if order_type in {"stop", "stop_limit"}:
+            raw_stop_price = order.get("stop_price")
+            if raw_stop_price is None:
+                return {"valid": False, "error": "Stop orders require a valid stop_price"}
             try:
-                stop_price = float(order.get("stop_price"))
+                stop_price = float(raw_stop_price)
             except (TypeError, ValueError):
                 return {"valid": False, "error": "Stop orders require a valid stop_price"}
             if not math.isfinite(stop_price) or stop_price <= 0:
@@ -147,8 +153,11 @@ class PolyglotBridge:
             if (order.get("trail_price") is None) == (order.get("trail_percent") is None):
                 return {"valid": False, "error": "Trailing stops require exactly one of trail_price or trail_percent"}
             field = "trail_price" if order.get("trail_price") is not None else "trail_percent"
+            raw_trail_value = order.get(field)
+            if raw_trail_value is None:
+                return {"valid": False, "error": f"{field} must be finite and positive"}
             try:
-                trail_value = float(order.get(field))
+                trail_value = float(raw_trail_value)
             except (TypeError, ValueError):
                 return {"valid": False, "error": f"{field} must be finite and positive"}
             if not math.isfinite(trail_value) or trail_value <= 0:
