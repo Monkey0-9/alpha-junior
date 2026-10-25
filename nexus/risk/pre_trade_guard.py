@@ -238,9 +238,22 @@ class PreTradeRiskGuard:
             }
 
         # 5. Governance checks (Concentration, Drawdown, Blacklist)
-        approved, violations = self.governance.check_compliance(
-            trade_compliance_req, portfolio_state, current_qty=current_qty
-        )
+        try:
+            approved, violations = self.governance.check_compliance(
+                trade_compliance_req, portfolio_state, current_qty=current_qty
+            )
+        except Exception as exc:
+            logger.critical(
+                "Governance decision could not be durably recorded; halting broker client: %s",
+                exc,
+            )
+            client.enabled = False
+            client.simulated = False
+            return {
+                "success": False,
+                "status": "rejected",
+                "error": "Governance audit persistence failed; order rejected and execution halted.",
+            }
         if not approved:
             logger.error(
                 f"[PRE-TRADE GUARD] Governance compliance failed for {symbol}: {violations}"
@@ -271,16 +284,34 @@ class PreTradeRiskGuard:
         )
 
         if res.get("success") or res.get("order_id") or res.get("id"):
-            self.governance.record_trade(
-                {
-                    "symbol": symbol,
-                    "side": side,
-                    "qty": qty,
-                    "price": float(price),
-                    "order_type": order_request.get("order_type", "market"),
-                    "strategy": order_request.get("strategy", "manual"),
-                    "status": "SUBMITTED",
+            try:
+                self.governance.record_trade(
+                    {
+                        "symbol": symbol,
+                        "side": side,
+                        "qty": qty,
+                        "price": float(price),
+                        "order_type": order_type,
+                        "strategy": order_request.get("strategy", "manual"),
+                        "status": "SUBMITTED",
+                    }
+                )
+            except Exception as exc:
+                # The broker may have accepted the order. Never return a generic
+                # failure that could induce a duplicate retry; stop new submissions.
+                logger.critical(
+                    "Broker order submitted but lineage persistence failed; halt and reconcile before retry: %s",
+                    exc,
+                )
+                client.enabled = False
+                client.simulated = False
+                return {
+                    "success": True,
+                    "status": "SUBMITTED_AUDIT_FAILURE",
+                    "order_id": res.get("order_id") or res.get("id"),
+                    "error": "Order may be active at the broker; trade lineage was not persisted. Do not retry; reconcile broker state and restore audit storage.",
+                    "reconciliation_required": True,
+                    "trading_halted": True,
                 }
-            )
 
         return res
