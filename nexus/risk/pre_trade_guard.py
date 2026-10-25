@@ -196,6 +196,8 @@ class PreTradeRiskGuard:
                         }
                 equity_raw = acc.get("equity", acc.get("portfolio_value"))
                 last_equity_raw = acc.get("last_equity", equity_raw)
+                if equity_raw is None or last_equity_raw is None:
+                    raise ValueError("Broker omitted equity values.")
                 equity = float(equity_raw)
                 last_equity = float(last_equity_raw)
                 if not math.isfinite(equity) or equity <= 0 or not math.isfinite(last_equity) or last_equity <= 0:
@@ -232,13 +234,14 @@ class PreTradeRiskGuard:
                 "error": "Portfolio equity/drawdown state is invalid; order rejected.",
             }
 
-        positions = portfolio_state.get("positions")
-        if not isinstance(positions, list):
+        positions_value = portfolio_state.get("positions")
+        if not isinstance(positions_value, list):
             return {
                 "success": False,
                 "status": "rejected",
                 "error": "Portfolio positions are unavailable; order rejected.",
             }
+        positions = positions_value
         for pos in positions:
             if isinstance(pos, dict) and str(pos.get("symbol", "")).upper() == symbol:
                 try:
