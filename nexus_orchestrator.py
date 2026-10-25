@@ -1,7 +1,7 @@
 import logging
 import os
 import socket
-import subprocess
+import subprocess  # nosec B404
 import sys
 import time
 from typing import List, Dict, Any
@@ -42,7 +42,7 @@ class NexusOrchestrator:
     ) -> None:
         logger.info("Launching %s...", name)
         # shell=False to avoid command injection and satisfy security linters.
-        p = subprocess.Popen(cmd, cwd=cwd, shell=False, env=env)
+        p = subprocess.Popen(cmd, cwd=cwd, shell=False, env=env)  # nosec B603
 
         self.processes.append(
             {"name": name, "cmd": cmd, "cwd": cwd, "env": env, "proc": p}

@@ -613,7 +613,7 @@ class AlpacaClient:
                     "h": float(prices[idx] * (1 + np.random.random() * 0.001)),
                     "l": float(prices[idx] * (1 - np.random.random() * 0.001)),
                     "c": float(prices[idx]),
-                    "v": int(1000 + np.random.randint(0, 1000)),
+                    "v": 1000 + np.random.randint(0, 1000),
                     "close": float(prices[idx]),
                 }
             )

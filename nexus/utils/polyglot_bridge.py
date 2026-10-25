@@ -2,7 +2,7 @@ import json
 import os
 import platform
 import shutil
-import subprocess
+import subprocess  # nosec B404
 import logging
 from typing import Dict, Any, List, cast
 
@@ -36,7 +36,7 @@ class PolyglotBridge:
                 "--",
                 input_data,
             ]
-            result = subprocess.run(
+            result = subprocess.run(  # nosec B603
                 cmd,
                 capture_output=True,
                 text=True,
@@ -75,7 +75,7 @@ class PolyglotBridge:
                 }
 
             cmd = [exe_path, backend_url]
-            result = subprocess.run(
+            result = subprocess.run(  # nosec B603
                 cmd,
                 capture_output=True,
                 text=True,
@@ -138,7 +138,7 @@ class PolyglotBridge:
                 "--",
                 input_data,
             ]
-            result = subprocess.run(
+            result = subprocess.run(  # nosec B603
                 cmd,
                 capture_output=True,
                 text=True,

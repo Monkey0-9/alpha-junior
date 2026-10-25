@@ -13,7 +13,7 @@ async def test_engine_no_trade_state() -> None:
     engine = NexusEngine()
 
     # Mock alpha engine to return some signals
-    setattr(engine.alpha_engine, "get_batch_signals", AsyncMock(return_value={"AAPL": 0.8}))
+    engine.alpha_engine.get_batch_signals = AsyncMock(return_value={"AAPL": 0.8})  # type: ignore[method-assign]
     dummy_data = pd.DataFrame({
         "open": np.linspace(100, 150, 50),
         "high": np.linspace(105, 155, 50),
@@ -21,7 +21,7 @@ async def test_engine_no_trade_state() -> None:
         "close": np.linspace(102, 152, 50),
         "volume": np.linspace(1000, 2000, 50)
     })
-    setattr(engine.alpha_engine, "fetch_market_data", AsyncMock(return_value=dummy_data))
+    engine.alpha_engine.fetch_market_data = AsyncMock(return_value=dummy_data)  # type: ignore[method-assign]
 
     # Mock Ensemble Brain to output 0 (NO_TRADE)
     with patch.object(engine.ensemble_brain, "get_signal", return_value=0.0):
@@ -65,12 +65,10 @@ async def test_engine_crisis_correlation() -> None:
 
     # Force a turbulent regime by returning highly volatile benchmark data
     volatile_close = [100, 95, 105, 90, 110, 85, 115, 80, 120, 75, 125]
-    setattr(
-        engine.alpha_engine,
-        "fetch_market_data",
-        AsyncMock(return_value=pd.DataFrame({"close": volatile_close})),
+    engine.alpha_engine.fetch_market_data = AsyncMock(  # type: ignore[method-assign]
+        return_value=pd.DataFrame({"close": volatile_close})
     )
-    setattr(engine.alpha_engine, "get_batch_signals", AsyncMock(return_value={"AAPL": 0.9}))
+    engine.alpha_engine.get_batch_signals = AsyncMock(return_value={"AAPL": 0.9})  # type: ignore[method-assign]
     engine.symbols = ["AAPL"]
 
     with patch.object(engine.ensemble_brain, "get_signal", return_value=0.9):

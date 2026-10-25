@@ -35,7 +35,14 @@ testpaths = ["tests"]
 python_files = "test_*.py"
 
 [tool.pyright]
-include = ["nexus"]
+include = ["nexus", "tests"]
+extraPaths = [
+  ".",
+  "nexus",
+  "nexus/cpp_extensions"
+]
+reportMissingImports = false
+reportMissingModuleSource = false
 executionEnvironments = [
   { root = "." }
 ]

@@ -368,7 +368,7 @@ class NexusEngine:
         )
 
         # Automated continuous model retraining step
-        for sym, df_history in history.items():
+        for df_history in history.values():
             if len(df_history) >= 100:
                 self.learner.step_retrain(df_history)
                 break

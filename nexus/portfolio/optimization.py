@@ -180,7 +180,7 @@ class PortfolioOptimizer:
 
         # Step 2: Kelly sizing — per-signal position fraction
         kelly_weights: Dict[str, float] = {}
-        for sym, sig in zip(symbols, scaled_signals):
+        for sym, sig in zip(symbols, scaled_signals, strict=False):
             win_rate = self.ic_tracker.get_win_rate(sym)
             # proxy from signal magnitude
             avg_win = max(0.005, abs(sig) * 0.012)

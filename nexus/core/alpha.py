@@ -38,6 +38,7 @@ try:
 
     WAVELET_AVAILABLE = True
 except ImportError:
+    pywt = None  # type: ignore[assignment, misc]
     WAVELET_AVAILABLE = False
 
 try:
@@ -95,7 +96,7 @@ class WaveletDenoiser:
     def denoise(
         self, prices: np.ndarray, wavelet: str = "db4", level: int = 3
     ) -> np.ndarray:
-        if not WAVELET_AVAILABLE or len(prices) < 2**level:
+        if not WAVELET_AVAILABLE or pywt is None or len(prices) < 2**level:
             return prices
         coeffs = pywt.wavedec(prices, wavelet, level=level)
         sigma = np.median(np.abs(coeffs[-1])) / 0.6745
@@ -170,6 +171,8 @@ class AlphaEngine:
                 columns={k: v for k, v in mapping.items() if k in df.columns}
             )
         else:
+            yf_logger: Optional[logging.Logger] = None
+            old_yf_level: Optional[int] = None
             try:
                 import yfinance as yf
 
@@ -190,11 +193,8 @@ class AlphaEngine:
                 logger.debug("yfinance fallback failed for %s: %s", symbol, e)
                 return pd.DataFrame()
             finally:
-                try:
-                    if "yf_logger" in locals() and "old_yf_level" in locals():
-                        yf_logger.setLevel(old_yf_level)
-                except Exception:
-                    pass
+                if yf_logger is not None and old_yf_level is not None:
+                    yf_logger.setLevel(old_yf_level)
         if df is None or (hasattr(df, "empty") and df.empty):
             return pd.DataFrame()
         return self._normalize_columns(df, limit)

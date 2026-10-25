@@ -1,6 +1,6 @@
 import logging
 import numpy as np
-from scipy.stats import norm, skew, kurtosis
+from scipy.stats import norm, skew, kurtosis  # type: ignore[import-untyped]
 from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)

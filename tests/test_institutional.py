@@ -55,7 +55,7 @@ def test_portfolio_optimizer() -> None:
     # — expected
     assert len(weights) >= 1
     # Strict institutional guarantee: every position <= MAX_POSITION and total <= 1.0
-    for sym, w in weights.items():
+    for w in weights.values():
         assert w <= optimizer.MAX_POSITION + 1e-6
     assert sum(weights.values()) <= 1.0 + 1e-6
 
@@ -73,7 +73,7 @@ def test_portfolio_optimizer() -> None:
     full_signals = [0.9, 0.9, 0.9, 0.9, 0.9]
     full_weights = optimizer.optimize_weights(full_symbols, full_signals)
     assert len(full_weights) == 5
-    for sym, w in full_weights.items():
+    for w in full_weights.values():
         assert w <= optimizer.MAX_POSITION + 1e-6
     assert abs(sum(full_weights.values()) - 1.0) < 1e-5
 

@@ -1,4 +1,4 @@
-import subprocess
+import subprocess  # nosec B404
 import time
 import sys
 import logging
@@ -85,7 +85,7 @@ class Nexus24x7Manager:
             self._orchestrator_log = open(log_path, "w", encoding="utf-8")
 
             # Launch orchestrator with pipe
-            self.orchestrator_process = subprocess.Popen(
+            self.orchestrator_process = subprocess.Popen(  # nosec B603
                 [sys.executable, "nexus_orchestrator.py"],
                 cwd=self.root,
                 stdout=subprocess.PIPE,
