@@ -1,8 +1,26 @@
+import os
+import sys
+
 from setuptools import setup, Extension
 import pybind11
 
-# Add standard library paths for C++ features on Windows MinGW/MSVC
-common_args = ["-O3", "-std=c++11", "-ffast-math"]
+# Use IEEE-compliant floating-point semantics. Fast-math can invalidate NaN/Inf
+# guards used by quantitative risk checks, so do not enable it for this engine.
+use_mingw = (
+    sys.platform == "win32"
+    and os.getenv("NEXUS_USE_MINGW", "0").strip().lower() in {"1", "true", "yes"}
+)
+if sys.platform == "win32" and not use_mingw:
+    common_args = ["/O2", "/std:c++14"]
+    link_args = []
+elif use_mingw:
+    common_args = ["-O3", "-std=c++11"]
+    link_args = ["-static-libgcc", "-static-libstdc++"]
+else:
+    common_args = ["-O3", "-std=c++11"]
+    link_args = []
+
+build_options = {"build_ext": {"compiler": "mingw32"}} if use_mingw else {}
 
 ext_modules = [
     Extension(
@@ -23,7 +41,7 @@ ext_modules = [
         include_dirs=[pybind11.get_include()],
         language="c++",
         extra_compile_args=common_args,
-        extra_link_args=["-static-libgcc", "-static-libstdc++"],
+        extra_link_args=link_args,
     ),
     Extension(
         "nexus_onnx",
@@ -56,4 +74,5 @@ setup(
     version="0.2.0",
     description="Nexus High-Performance C++ Trading Engine",
     ext_modules=ext_modules,
+    options=build_options,
 )
