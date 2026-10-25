@@ -15,20 +15,36 @@ class PolyglotBridge:
     """Cross-platform bridge for high-performance satellite engines."""
 
     @staticmethod
+    @staticmethod
     def calculate_risk_rust(
         returns: List[float],
         conf: float = 0.95,
     ) -> Dict[str, Any]:
-        """Execute Rust Risk Engine for VaR calculation."""
-        input_data = json.dumps({"returns": returns, "confidence_level": conf})
+        """Execute Rust VaR calculation without disguising missing results as zero."""
         try:
+            if not returns or not all(math.isfinite(float(value)) for value in returns):
+                return {
+                    "var": None,
+                    "expected_shortfall": None,
+                    "status": "INVALID_INPUT",
+                }
+            if not math.isfinite(conf) or not 0.0 < conf < 1.0:
+                return {
+                    "var": None,
+                    "expected_shortfall": None,
+                    "status": "INVALID_CONFIDENCE",
+                }
             if not shutil.which("cargo"):
                 return {
-                    "var": 0.0,
-                    "expected_shortfall": 0.0,
+                    "var": None,
+                    "expected_shortfall": None,
                     "status": "RUST_NOT_INSTALLED",
                 }
 
+            input_data = json.dumps(
+                {"returns": [float(value) for value in returns], "confidence_level": conf},
+                allow_nan=False,
+            )
             cmd = [
                 "cargo",
                 "run",
@@ -43,14 +59,30 @@ class PolyglotBridge:
                 capture_output=True,
                 text=True,
                 check=True,
+                timeout=30,
             )
-            return cast(Dict[str, Any], json.loads(result.stdout))
-        except Exception as exc:
-            logger.debug(f"Rust Risk Engine fallback: {exc}")
+            payload = cast(Dict[str, Any], json.loads(result.stdout))
+            var_value = payload.get("var")
+            es_value = payload.get("expected_shortfall")
+            if (
+                var_value is None
+                or es_value is None
+                or not math.isfinite(float(var_value))
+                or not math.isfinite(float(es_value))
+            ):
+                raise ValueError("Rust risk engine returned missing/non-finite risk values.")
             return {
-                "var": 0.0,
-                "expected_shortfall": 0.0,
-                "status": "FALLBACK",
+                "var": float(var_value),
+                "expected_shortfall": float(es_value),
+                "status": "OK",
+            }
+        except Exception as exc:
+            logger.error("Rust risk engine unavailable; native risk results are invalid: %s", exc)
+            return {
+                "var": None,
+                "expected_shortfall": None,
+                "status": "RUST_ERROR",
+                "error": str(exc),
             }
 
     @staticmethod
