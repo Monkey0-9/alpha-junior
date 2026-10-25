@@ -102,7 +102,24 @@ async def submit_order(
 async def cancel_order(
     order_id: str, client: AlpacaClient = Depends(get_alpaca)
 ) -> Dict[str, Any]:
-    return await client.cancel_order(order_id)
+    # Do not tell clients cancellation succeeded unless broker confirms it.
+    result = await client.cancel_order(order_id)
+    if not result.get("success"):
+        status = str(result.get("status", "")).upper()
+        if status in {"UNKNOWN", "TIMEOUT", "SUBMISSION_UNKNOWN"}:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "status": "CANCEL_OUTCOME_UNKNOWN",
+                    "message": "Cancellation outcome is unknown; reconcile broker order state before retrying.",
+                    "reconciliation_required": True,
+                },
+            )
+        raise HTTPException(
+            status_code=502,
+            detail=result.get("error", "Broker did not confirm order cancellation."),
+        )
+    return result
 
 
 @router.post("/buy")
