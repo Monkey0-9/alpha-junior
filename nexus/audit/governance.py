@@ -10,7 +10,8 @@ logger = logging.getLogger(__name__)
 
 
 # Default DB path — data/ directory in project root
-_DB_DIR = Path("data")
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_DB_DIR = _PROJECT_ROOT / "data"
 _DB_PATH = _DB_DIR / "nexus_audit.db"
 
 
@@ -190,7 +191,8 @@ class GovernanceEngine:
             )
             self._db.commit()
         except sqlite3.Error as exc:
-            logger.warning(f"Audit DB write failed: {exc}")
+            logger.critical("Audit DB write failed; the trading decision must not proceed: %s", exc)
+            raise RuntimeError("Unable to durably persist the governance decision.") from exc
 
         msg = (
             f"AUDIT: {status} - {request['side']} "
@@ -219,4 +221,8 @@ class GovernanceEngine:
             )
             self._db.commit()
         except sqlite3.Error as exc:
-            logger.warning(f"Trade history write failed: {exc}")
+            logger.critical(
+                "Trade history write failed after broker submission; manual reconciliation is required: %s",
+                exc,
+            )
+            raise RuntimeError("Unable to durably persist submitted trade lineage.") from exc
