@@ -23,13 +23,24 @@ async def test_private_read_fails_closed_when_api_key_missing(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_private_read_requires_key_even_for_get(monkeypatch):
-    monkeypatch.setenv("NEXUS_API_KEY", "test-secret-key-for-unit-tests")
+    monkeypatch.setenv("NEXUS_API_KEY", "test-secret-key-for-unit-tests-123456")
     from nexus.api.main import app
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         response = await client.get("/api/monitor/brain")
     assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_weak_api_key_fails_closed(monkeypatch):
+    monkeypatch.setenv("NEXUS_API_KEY", "short")
+    from nexus.api.main import app
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.get("/api/monitor/brain")
+    assert response.status_code == 503
 
 
 @pytest.mark.asyncio
