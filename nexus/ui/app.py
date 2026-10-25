@@ -142,6 +142,7 @@ def fetch(endpoint: str) -> Optional[Any]:
         headers = {"X-API-Key": API_KEY} if API_KEY else {}
         with httpx.Client(timeout=12, headers=headers) as client:
             resp = client.get(f"{BACKEND_URL}/{endpoint}")
+            resp.raise_for_status()
             return resp.json()
     except Exception:
         return None
