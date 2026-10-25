@@ -105,6 +105,12 @@ async def test_guard_rejects_unverified_account_state_without_submission(monkeyp
     client = MagicMock()
     client.enabled = True
     client.simulated = False
+    client.get_bars = AsyncMock(
+        return_value=[{
+            "t": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+            "close": 100.0,
+        }]
+    )
     client.get_account = AsyncMock(
         return_value={"enabled": True, "simulated": False, "status": "ERROR", "error": "network"}
     )
