@@ -1,5 +1,7 @@
 import pytest
 import numpy as np
+from datetime import datetime, timezone
+from unittest.mock import AsyncMock
 
 from nexus.risk.pre_trade_guard import PreTradeRiskGuard
 from nexus.execution.alpaca import AlpacaClient, AlpacaCredentials
@@ -36,6 +38,14 @@ async def test_pre_trade_guard_governance_concentration() -> None:
     client = AlpacaClient(credentials=AlpacaCredentials("KEY", "SECRET"))
     client.enabled = True
     client.simulated = False  # Live broker mode
+    # Use a trusted, fresh mark so the test reaches concentration governance
+    # without making a network request with fake credentials.
+    client.get_bars = AsyncMock(
+        return_value=[{
+            "t": datetime.now(timezone.utc).isoformat(),
+            "close": 100.0,
+        }]
+    )
 
     # Order value = 300 * $100 = $30,000, which is 30% of $100,000 equity (exceeds 20% max)
     oversized_order = {
@@ -124,7 +134,7 @@ def test_polyglot_zig_validation_defense_in_depth() -> None:
     assert "symbol" in res3["error"].lower()
 
     # Valid Order
-    res4 = PolyglotBridge.validate_order_zig({"symbol": "AAPL", "qty": 10, "price": 150.0})
+    res4 = PolyglotBridge.validate_order_zig({"symbol": "AAPL", "qty": 10, "price": 150.0, "side": "buy"})
     assert res4["valid"] is True
 
 
