@@ -143,6 +143,17 @@ class PolyglotBridge:
             if not math.isfinite(stop_price) or stop_price <= 0:
                 return {"valid": False, "error": "stop_price must be finite and positive"}
 
+        if order_type == "trailing_stop":
+            if (order.get("trail_price") is None) == (order.get("trail_percent") is None):
+                return {"valid": False, "error": "Trailing stops require exactly one of trail_price or trail_percent"}
+            field = "trail_price" if order.get("trail_price") is not None else "trail_percent"
+            try:
+                trail_value = float(order.get(field))
+            except (TypeError, ValueError):
+                return {"valid": False, "error": f"{field} must be finite and positive"}
+            if not math.isfinite(trail_value) or trail_value <= 0:
+                return {"valid": False, "error": f"{field} must be finite and positive"}
+
         if not shutil.which("zig"):
             if strict_polyglot:
                 return {"valid": False, "error": "ZIG_NOT_INSTALLED_FAIL_CLOSED"}
