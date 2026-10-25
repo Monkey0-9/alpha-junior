@@ -7,6 +7,7 @@ without passing this unified gate.
 """
 
 import logging
+import math
 from typing import Dict, Any, Optional
 from nexus.audit.governance import GovernanceEngine
 from nexus.utils.polyglot_bridge import PolyglotBridge
@@ -41,9 +42,36 @@ class PreTradeRiskGuard:
         """
         Single mandatory risk-approval boundary covering every order route.
         """
-        symbol = order_request.get("symbol", "").upper()
-        qty = float(order_request.get("qty", 0.0))
-        side = order_request.get("side", "buy").lower()
+        symbol = str(order_request.get("symbol", "")).strip().upper()
+        side = str(order_request.get("side", "buy")).strip().lower()
+        try:
+            qty = float(order_request.get("qty", 0.0))
+        except (TypeError, ValueError):
+            qty = float("nan")
+
+        if not symbol or not symbol.replace(".", "").replace("-", "").isalnum():
+            return {"success": False, "status": "rejected", "error": "Invalid order symbol."}
+        if side not in {"buy", "sell"}:
+            return {"success": False, "status": "rejected", "error": "Order side must be buy or sell."}
+        if not math.isfinite(qty) or qty <= 0:
+            return {"success": False, "status": "rejected", "error": "Order quantity must be finite and positive."}
+
+        order_type = str(order_request.get("order_type", "market")).lower()
+        if order_type not in {"market", "limit", "stop", "stop_limit", "trailing_stop"}:
+            return {"success": False, "status": "rejected", "error": "Unsupported order type."}
+        for field in ("limit_price", "stop_price", "trail_price", "trail_percent"):
+            value = order_request.get(field)
+            if value is not None:
+                try:
+                    numeric_value = float(value)
+                except (TypeError, ValueError):
+                    numeric_value = float("nan")
+                if not math.isfinite(numeric_value) or numeric_value <= 0:
+                    return {"success": False, "status": "rejected", "error": f"{field} must be finite and positive."}
+        if order_type in {"limit", "stop_limit"} and order_request.get("limit_price") is None:
+            return {"success": False, "status": "rejected", "error": "Limit orders require limit_price."}
+        if order_type in {"stop", "stop_limit"} and order_request.get("stop_price") is None:
+            return {"success": False, "status": "rejected", "error": "Stop orders require stop_price."}
 
         # 1. State integrity check: Fail-closed on disabled broker
         if not client.enabled and not client.simulated:
@@ -61,10 +89,30 @@ class PreTradeRiskGuard:
             }
 
         # 2. Estimate price if not provided
-        price = order_request.get("price") or order_request.get("limit_price")
-        if not price or float(price) <= 0:
+        price = order_request.get("price") or order_request.get("limit_price") or order_request.get("stop_price")
+        try:
+            price_value = float(price) if price is not None else 0.0
+        except (TypeError, ValueError):
+            price_value = 0.0
+        if not math.isfinite(price_value) or price_value <= 0:
             bars = await client.get_bars(symbol, timeframe="1Min", limit=1)
-            price = float(bars[-1]["close"]) if bars else 100.0
+            if not bars:
+                return {
+                    "success": False,
+                    "status": "rejected",
+                    "error": "No trustworthy current market price is available; order rejected.",
+                }
+            try:
+                price_value = float(bars[-1].get("close", bars[-1].get("c", 0.0)))
+            except (TypeError, ValueError, KeyError):
+                price_value = 0.0
+        if not math.isfinite(price_value) or price_value <= 0:
+            return {
+                "success": False,
+                "status": "rejected",
+                "error": "Market price is missing or invalid; order rejected.",
+            }
+        price = price_value
 
         trade_compliance_req = {
             "symbol": symbol,
@@ -79,27 +127,69 @@ class PreTradeRiskGuard:
         if portfolio_state is None:
             try:
                 acc = await client.get_account()
-                equity = float(acc.get("equity", Config.FALLBACK_EQUITY))
-                last_equity = float(acc.get("last_equity", equity))
-                dd = max(0.0, (last_equity - equity) / max(equity, 1.0))
+                if not client.simulated:
+                    if not client.enabled or acc.get("status") != "ACTIVE" or acc.get("simulated"):
+                        return {
+                            "success": False,
+                            "status": "rejected",
+                            "error": "Broker account state is not verified ACTIVE; pre-trade checks fail closed.",
+                        }
+                equity_raw = acc.get("equity", acc.get("portfolio_value"))
+                last_equity_raw = acc.get("last_equity", equity_raw)
+                equity = float(equity_raw)
+                last_equity = float(last_equity_raw)
+                if not math.isfinite(equity) or equity <= 0 or not math.isfinite(last_equity) or last_equity <= 0:
+                    raise ValueError("Broker returned invalid equity values.")
+                dd = max(0.0, (last_equity - equity) / last_equity)
                 positions = await client.get_positions()
                 portfolio_state = {
                     "total_value": equity,
                     "drawdown": dd,
                     "positions": positions,
                 }
-                # Find current_qty if not supplied
-                for pos in positions:
-                    if pos.get("symbol") == symbol:
-                        current_qty = float(pos.get("qty", 0.0))
-                        break
             except Exception as e:
-                logger.warning(f"Failed to fetch live state for pre-trade check: {e}")
-                portfolio_state = {
-                    "total_value": Config.FALLBACK_EQUITY,
-                    "drawdown": 0.0,
-                    "positions": [],
+                logger.error("Unable to establish verified portfolio state; rejecting order: %s", e)
+                return {
+                    "success": False,
+                    "status": "rejected",
+                    "error": "Unable to verify broker account and positions; order rejected.",
                 }
+
+        try:
+            total_value = float(portfolio_state.get("total_value", 0.0))
+            drawdown = float(portfolio_state.get("drawdown", float("nan")))
+        except (TypeError, ValueError):
+            total_value, drawdown = 0.0, float("nan")
+        if (
+            not math.isfinite(total_value)
+            or total_value <= 0
+            or not math.isfinite(drawdown)
+            or drawdown < 0
+        ):
+            return {
+                "success": False,
+                "status": "rejected",
+                "error": "Portfolio equity/drawdown state is invalid; order rejected.",
+            }
+
+        positions = portfolio_state.get("positions")
+        if not isinstance(positions, list):
+            return {
+                "success": False,
+                "status": "rejected",
+                "error": "Portfolio positions are unavailable; order rejected.",
+            }
+        for pos in positions:
+            if isinstance(pos, dict) and str(pos.get("symbol", "")).upper() == symbol:
+                try:
+                    current_qty = float(pos.get("qty", current_qty))
+                except (TypeError, ValueError):
+                    return {
+                        "success": False,
+                        "status": "rejected",
+                        "error": "Current position quantity is invalid; order rejected.",
+                    }
+                break
 
         # 4. Zig / Polyglot syntax & limit validation
         zig_res = PolyglotBridge.validate_order_zig(trade_compliance_req)
