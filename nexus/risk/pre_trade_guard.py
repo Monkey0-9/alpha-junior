@@ -89,14 +89,19 @@ class PreTradeRiskGuard:
                 "error": "Broker is in SIMULATION mode but NEXUS_ALLOW_SIMULATION_FALLBACK is false. Pre-trade check failed.",
             }
 
-        # 2. Estimate price if not provided
-        price = order_request.get("price") or order_request.get("limit_price") or order_request.get("stop_price")
-        try:
-            price_value = float(price) if price is not None else 0.0
-        except (TypeError, ValueError):
-            price_value = 0.0
-        if not math.isfinite(price_value) or price_value <= 0:
-            bars = await client.get_bars(symbol, timeframe="1Min", limit=1)
+        # 2. Establish a trustworthy mark for portfolio risk checks. Live orders
+        # always use a fresh broker-market bar, never the caller's limit price.
+        price_value = 0.0
+        if not client.simulated:
+            try:
+                bars = await client.get_bars(symbol, timeframe="1Min", limit=1)
+            except Exception as exc:
+                logger.error("Unable to fetch current mark for %s: %s", symbol, exc)
+                return {
+                    "success": False,
+                    "status": "rejected",
+                    "error": "Unable to verify current market data; order rejected.",
+                }
             if not bars:
                 return {
                     "success": False,
@@ -104,44 +109,64 @@ class PreTradeRiskGuard:
                     "error": "No trustworthy current market price is available; order rejected.",
                 }
             latest_bar = bars[-1]
-            if not client.simulated:
-                timestamp = latest_bar.get("t") or latest_bar.get("timestamp") or latest_bar.get("time")
-                if not isinstance(timestamp, str) or not timestamp.strip():
+            timestamp = latest_bar.get("t") or latest_bar.get("timestamp") or latest_bar.get("time")
+            if not isinstance(timestamp, str) or not timestamp.strip():
+                return {
+                    "success": False,
+                    "status": "rejected",
+                    "error": "Market bar has no timestamp; order rejected.",
+                }
+            try:
+                timestamp_text = timestamp.strip()
+                if timestamp_text.endswith("Z"):
+                    timestamp_text = timestamp_text[:-1] + "+00:00"
+                bar_time = datetime.fromisoformat(timestamp_text)
+                if bar_time.tzinfo is None:
+                    raise ValueError("timestamp lacks timezone")
+                age_seconds = (
+                    datetime.now(timezone.utc) - bar_time.astimezone(timezone.utc)
+                ).total_seconds()
+                max_age = max(1, int(Config.MAX_MARKET_DATA_AGE_SECONDS))
+                if age_seconds < -60 or age_seconds > max_age:
                     return {
                         "success": False,
                         "status": "rejected",
-                        "error": "Market bar has no timestamp; order rejected.",
+                        "error": f"Market data is stale or future-dated (age={age_seconds:.1f}s, limit={max_age}s); order rejected.",
                     }
-                try:
-                    timestamp_text = timestamp.strip()
-                    if timestamp_text.endswith("Z"):
-                        timestamp_text = timestamp_text[:-1] + "+00:00"
-                    bar_time = datetime.fromisoformat(timestamp_text)
-                    if bar_time.tzinfo is None:
-                        raise ValueError("timestamp lacks timezone")
-                    age_seconds = (datetime.now(timezone.utc) - bar_time.astimezone(timezone.utc)).total_seconds()
-                    max_age = max(1, int(Config.MAX_MARKET_DATA_AGE_SECONDS))
-                    if age_seconds < -60 or age_seconds > max_age:
-                        return {
-                            "success": False,
-                            "status": "rejected",
-                            "error": f"Market data is stale or future-dated (age={age_seconds:.1f}s, limit={max_age}s); order rejected.",
-                        }
-                except (TypeError, ValueError, OverflowError):
-                    return {
-                        "success": False,
-                        "status": "rejected",
-                        "error": "Market bar timestamp is invalid; order rejected.",
-                    }
+            except (TypeError, ValueError, OverflowError):
+                return {
+                    "success": False,
+                    "status": "rejected",
+                    "error": "Market bar timestamp is invalid; order rejected.",
+                }
             try:
                 price_value = float(latest_bar.get("close", latest_bar.get("c", 0.0)))
             except (TypeError, ValueError, KeyError):
                 price_value = 0.0
+        else:
+            # Simulation is explicit and cannot be mistaken for live valuation.
+            raw_price = (
+                order_request.get("price")
+                or order_request.get("limit_price")
+                or order_request.get("stop_price")
+            )
+            try:
+                price_value = float(raw_price) if raw_price is not None else 0.0
+            except (TypeError, ValueError):
+                price_value = 0.0
+            if not math.isfinite(price_value) or price_value <= 0:
+                bars = await client.get_bars(symbol, timeframe="1Min", limit=1)
+                if bars:
+                    try:
+                        price_value = float(bars[-1].get("close", bars[-1].get("c", 0.0)))
+                    except (TypeError, ValueError, KeyError):
+                        price_value = 0.0
+
         if not math.isfinite(price_value) or price_value <= 0:
             return {
                 "success": False,
                 "status": "rejected",
-                "error": "Market price is missing or invalid; order rejected.",
+                "error": "Market mark is missing or invalid; order rejected.",
             }
         price = price_value
 
