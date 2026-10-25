@@ -3,6 +3,7 @@ import sys
 
 from setuptools import setup, Extension
 import pybind11
+from setuptools.command.build_ext import build_ext as _build_ext
 
 # Use IEEE-compliant floating-point semantics. Fast-math can invalidate NaN/Inf
 # guards used by quantitative risk checks, so do not enable it for this engine.
@@ -19,6 +20,17 @@ elif use_mingw:
 else:
     common_args = ["-O3", "-std=c++11"]
     link_args = []
+
+class PlatformBuildExt(_build_ext):
+    """Ensure setuptools emits platform-native extension artifacts."""
+
+    def get_export_symbols(self, ext):
+        symbols = super().get_export_symbols(ext)
+        if sys.platform != "win32":
+            # Windows .def export lists are not accepted by ELF/Mach-O linkers.
+            symbols = [symbol for symbol in symbols if not symbol.lower().endswith(".def")]
+        return symbols
+
 
 build_options = {"build_ext": {"compiler": "mingw32"}} if use_mingw else {}
 
@@ -75,4 +87,5 @@ setup(
     description="Nexus High-Performance C++ Trading Engine",
     ext_modules=ext_modules,
     options=build_options,
+    cmdclass={"build_ext": PlatformBuildExt},
 )
