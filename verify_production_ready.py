@@ -98,63 +98,72 @@ class ProductionVerifier:
             return False
 
     async def test_security_hardening(self) -> bool:
-        """Verify API authentication and CORS policies."""
-        logger.info("\n" + "=" * 60)
+        """Verify fail-closed authentication for private reads and writes."""
+        logger.info("\\n" + "=" * 60)
         logger.info("3. TESTING SECURITY HARDENING")
         logger.info("=" * 60)
 
         try:
             from nexus.api.main import app
-            from nexus.utils.config import Config
+
+            configured_key = __import__("os").getenv("NEXUS_API_KEY", "").strip()
+            placeholder_keys = {
+                "changeme",
+                "your_api_key",
+                "your_secure_api_key",
+                "generate_a_secure_random_key_for_internal_auth",
+            }
+            if configured_key.lower() in placeholder_keys:
+                configured_key = ""
 
             transport = httpx.ASGITransport(app=app)  # type: ignore
             async with httpx.AsyncClient(
                 transport=transport, base_url="http://testserver"
             ) as client:
-                # 1. Test Public GET (Brain snapshot)
-                resp = await client.get("/api/monitor/brain")
-                if resp.status_code not in {200, 502}:
+                # Public health is intentionally liveness-only.
+                health_resp = await client.get("/api/monitor/health")
+                if health_resp.status_code != 200:
+                    logger.error("  [FAIL] Public liveness endpoint returned %s", health_resp.status_code)
+                    self.results["security_hardening"] = False
+                    return False
+
+                # Account/market-intelligence reads are private, not just mutations.
+                private_resp = await client.get("/api/monitor/brain")
+                expected_unauth = 401 if configured_key else 503
+                if private_resp.status_code != expected_unauth:
                     logger.error(
-                        f"  [FAIL] Public read endpoint returned unexpected {resp.status_code}"
+                        "  [FAIL] Private read without key returned %s; expected %s",
+                        private_resp.status_code, expected_unauth
                     )
                     self.results["security_hardening"] = False
                     return False
-                logger.info("  [OK] Public read endpoint is accessible")
 
-                # 2. Test Protected POST (Mutation without Key)
-                if Config.API_KEY:
-                    resp = await client.post("/api/alpaca/order", json={})
-                    if resp.status_code != 401:
-                        logger.error(
-                            f"  [FAIL] Mutation endpoint allowed unauthorized access! Status: {resp.status_code}"
-                        )
-                        self.results["security_hardening"] = False
-                        return False
-                    logger.info(
-                        "  [OK] Mutation endpoint is STRICTLY PROTECTED (401 Unauthorized)"
-                    )
+                # Without a real key the service must fail closed, not run open.
+                if not configured_key:
+                    logger.info("  [OK] Missing/placeholder key fails closed with HTTP 503")
+                    self.results["security_hardening"] = True
+                    return True
 
-                    # 3. Test Authorized POST with valid key
-                    resp = await client.post(
-                        "/api/alpaca/order",
-                        json={},
-                        headers={"X-API-Key": Config.API_KEY},
+                # A supplied key must reach request-body validation; malformed body
+                # should produce 422 and never cause an execution submission.
+                authorized_resp = await client.post(
+                    "/api/alpaca/order",
+                    json={},
+                    headers={"X-API-Key": configured_key},
+                )
+                if authorized_resp.status_code != 422:
+                    logger.error(
+                        "  [FAIL] Authorized malformed order returned %s, expected 422",
+                        authorized_resp.status_code
                     )
-                    # 422 is expected for empty body validation error, 403 for pre-trade guard rejection
-                    if resp.status_code not in {422, 403}:
-                        logger.error(
-                            f"  [FAIL] Authorized mutation returned unexpected status: {resp.status_code}"
-                        )
-                        self.results["security_hardening"] = False
-                        return False
-                    logger.info(
-                        f"  [OK] Mutation endpoint is ACCESSIBLE with valid API Key (Status: {resp.status_code})"
-                    )
+                    self.results["security_hardening"] = False
+                    return False
 
             self.results["security_hardening"] = True
+            logger.info("  [OK] Private reads and writes require configured API key")
             return True
         except Exception as e:
-            logger.error(f"  [FAIL] Security test error: {e}")
+            logger.error("  [FAIL] Security test error: %s", e)
             self.results["security_hardening"] = False
             return False
 
@@ -177,15 +186,12 @@ class ProductionVerifier:
 
             # 2. Monte Carlo Check
             mc = MonteCarloSimulator()
-            returns = np.random.normal(0.0005, 0.01, 100)
+            returns = np.random.default_rng(20261025).normal(0.0005, 0.01, 100)
             prob = mc.run_survival_analysis(100000, returns, days=10, n_simulations=50)
-            if prob != 0.999:
-                logger.info(
-                    f"  [OK] Monte Carlo simulator is ACTIVE (Result: {prob:.4f})"
-                )
-            else:
-                logger.error("  [FAIL] Monte Carlo simulator returned hardcoded 0.999")
+            if not np.isfinite(prob) or not 0.0 <= prob <= 1.0:
+                logger.error("  [FAIL] Monte Carlo simulator returned invalid probability: %s", prob)
                 return False
+            logger.info("  [OK] Monte Carlo returned bounded probability %.4f", prob)
 
             self.results["quant_integrity"] = True
             return True
@@ -195,8 +201,8 @@ class ProductionVerifier:
             return False
 
     async def test_alpaca_connection(self) -> bool:
-        """Test Alpaca API connection."""
-        logger.info("\n" + "=" * 60)
+        """Require a verified real broker session; simulation is not broker readiness."""
+        logger.info("\\n" + "=" * 60)
         logger.info("5. TESTING ALPACA CONNECTION")
         logger.info("=" * 60)
 
@@ -204,32 +210,34 @@ class ProductionVerifier:
             from nexus.execution.alpaca import get_client
 
             client = get_client()
-            if not client.enabled:
-                from nexus.utils.config import Config
-                if Config.ALLOW_SIMULATION_FALLBACK:
-                    logger.warning("  ⚠ Alpaca client not enabled (Simulator mode explicitly permitted)")
-                    self.results["alpaca_connection"] = True
-                    return True
-                else:
-                    logger.error("  [FAIL] Alpaca client is disabled and simulation fallback is disallowed.")
-                    self.results["alpaca_connection"] = False
-                    return False
+            if not client.enabled or client.simulated:
+                logger.error("  [FAIL] Broker is disabled or simulated; this is not production readiness.")
+                self.results["alpaca_connection"] = False
+                return False
 
             account = await client.get_account()
-            if account.get("status") in {"ERROR", "UNAUTHORIZED"}:
+            try:
+                equity = float(account.get("equity", 0.0))
+            except (TypeError, ValueError):
+                equity = 0.0
+            if (
+                account.get("status") != "ACTIVE"
+                or account.get("simulated")
+                or not np.isfinite(equity)
+                or equity <= 0
+            ):
                 logger.error(
-                    f"  [FAIL] Alpaca broker authentication failed: {account.get('error', 'UNAUTHORIZED')}"
+                    "  [FAIL] Broker account is not verified ACTIVE with positive equity: status=%s",
+                    account.get("status", "UNKNOWN"),
                 )
                 self.results["alpaca_connection"] = False
                 return False
 
-            logger.info(
-                f"  [OK] Connected to Alpaca. Status: {account.get('status', 'ACTIVE')}"
-            )
+            logger.info("  [OK] Real Alpaca account verified ACTIVE; equity value is present.")
             self.results["alpaca_connection"] = True
             return True
         except Exception as e:
-            logger.error(f"  [FAIL] Alpaca connection error: {e}")
+            logger.error("  [FAIL] Alpaca connection error: %s", e)
             self.results["alpaca_connection"] = False
             return False
 
