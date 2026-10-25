@@ -113,7 +113,10 @@ class ProductionVerifier:
                 "your_secure_api_key",
                 "generate_a_secure_random_key_for_internal_auth",
             }
-            if configured_key.lower() in placeholder_keys:
+            if (
+                len(configured_key) < 32
+                or configured_key.lower() in placeholder_keys
+            ):
                 configured_key = ""
 
             transport = httpx.ASGITransport(app=app)  # type: ignore
