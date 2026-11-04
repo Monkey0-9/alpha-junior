@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi import APIRouter, HTTPException, Depends, Query, Header
 from typing import Optional, Dict, Any, Literal
 from pydantic import BaseModel, Field, ConfigDict
 import logging
@@ -25,7 +25,7 @@ class OrderRequest(BaseModel):
     stop_price: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
     trail_price: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
     trail_percent: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
-    client_order_id: Optional[str] = Field(default=None, max_length=32)
+    client_order_id: str = Field(min_length=16, max_length=32, pattern=r"^[A-Za-z0-9._-]+$")
     extended_hours: bool = False
 
 
@@ -132,12 +132,21 @@ async def cancel_order(
 async def buy_stock(
     symbol: str = Query(min_length=1, max_length=16),
     qty: float = Query(gt=0, allow_inf_nan=False),
+    client_order_id: str = Header(
+        min_length=16,
+        max_length=32,
+        pattern=r"^[A-Za-z0-9._-]+$",
+        alias="Idempotency-Key",
+    ),
     client: AlpacaClient = Depends(get_alpaca)
 ) -> Dict[str, Any]:
     guard = PreTradeRiskGuard.get_instance()
     result = await guard.validate_and_submit(
-        client, {"symbol": symbol, "qty": qty, "side": "buy"}
+        client,
+        {"symbol": symbol, "qty": qty, "side": "buy", "client_order_id": client_order_id},
     )
+    if result.get("reconciliation_required") or result.get("trading_halted"):
+        raise HTTPException(status_code=503, detail=result)
     if result.get("status") == "rejected":
         raise HTTPException(
             status_code=403,
@@ -150,12 +159,21 @@ async def buy_stock(
 async def sell_stock(
     symbol: str = Query(min_length=1, max_length=16),
     qty: float = Query(gt=0, allow_inf_nan=False),
+    client_order_id: str = Header(
+        min_length=16,
+        max_length=32,
+        pattern=r"^[A-Za-z0-9._-]+$",
+        alias="Idempotency-Key",
+    ),
     client: AlpacaClient = Depends(get_alpaca)
 ) -> Dict[str, Any]:
     guard = PreTradeRiskGuard.get_instance()
     result = await guard.validate_and_submit(
-        client, {"symbol": symbol, "qty": qty, "side": "sell"}
+        client,
+        {"symbol": symbol, "qty": qty, "side": "sell", "client_order_id": client_order_id},
     )
+    if result.get("reconciliation_required") or result.get("trading_halted"):
+        raise HTTPException(status_code=503, detail=result)
     if result.get("status") == "rejected":
         raise HTTPException(
             status_code=403,
