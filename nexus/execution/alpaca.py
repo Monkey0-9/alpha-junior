@@ -142,21 +142,15 @@ class AlpacaClient:
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     }
                 if response.status == 401:
-                    logger.error(
-                        "Alpaca API Keys invalid (401). Rejecting connection - silent simulation fallback disabled for safety."
-                    )
-                    if Config.ALLOW_SIMULATION_FALLBACK:
-                        logger.warning(
-                            "Simulation fallback explicitly permitted by NEXUS_ALLOW_SIMULATION_FALLBACK."
-                        )
-                        self.simulated = True
-                        return await self.get_account()
+                    # Authentication failure never changes a live client to simulation.
                     self.enabled = False
+                    self.simulated = False
+                    logger.critical("Alpaca credentials rejected (401); execution disabled.")
                     return {
                         "enabled": False,
                         "simulated": False,
                         "status": "UNAUTHORIZED",
-                        "error": "Alpaca API credentials invalid (401). Live execution disabled.",
+                        "error": "Alpaca API credentials invalid (401). Execution disabled; correct credentials explicitly.",
                     }
                 return {
                     "enabled": True,
@@ -208,10 +202,16 @@ class AlpacaClient:
                         }
                         for p in positions
                     ]
-                return []
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            logger.warning(f"Failed to fetch Alpaca positions: {e}")
-            return []
+                if response.status == 401:
+                    self.enabled = False
+                    self.simulated = False
+                    raise RuntimeError("Alpaca credentials rejected while fetching positions.")
+                raise RuntimeError(
+                    f"Unable to establish broker position state (HTTP {response.status})."
+                )
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logger.error("Unable to establish broker position state: %s", exc)
+            raise RuntimeError("Broker position state is unknown; trading must halt.") from exc
 
     async def submit_order(
         self,
@@ -324,19 +324,36 @@ class AlpacaClient:
                         "asset_class": asset_class,
                         "raw": data,
                     }
-                logger.error(f"Alpaca order rejected: {response.status} {data}")
+                if response.status == 401:
+                    self.enabled = False
+                    self.simulated = False
+                    return {
+                        "success": False,
+                        "status": "UNAUTHORIZED",
+                        "error": "Broker credentials rejected; execution disabled.",
+                        "asset_class": asset_class,
+                        "raw": data,
+                    }
+                logger.error("Alpaca order rejected: %s %s", response.status, data)
                 return {
                     "success": False,
+                    "status": "REJECTED",
                     "error": data.get("message", data),
                     "asset_class": asset_class,
                     "raw": data,
                 }
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            logger.error(f"Order submit failed: {e}")
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            # A timeout after POST may still mean the broker accepted the order.
+            logger.critical("Order submission outcome unknown for %s: %s", symbol, exc)
+            self.enabled = False
+            self.simulated = False
             return {
                 "success": False,
-                "error": str(e),
+                "status": "SUBMISSION_UNKNOWN",
+                "error": "Broker submission outcome unknown. Trading is halted until orders and positions are reconciled.",
                 "asset_class": asset_class,
+                "reconciliation_required": True,
+                "trading_halted": True,
             }
 
     async def get_orders(
@@ -355,10 +372,15 @@ class AlpacaClient:
             ) as response:
                 if response.status in {200, 201}:
                     return cast(List[Dict[str, Any]], await response.json())
-                return []
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            logger.warning(f"Failed to fetch Alpaca orders: {e}")
-            return []
+                if response.status == 401:
+                    self.enabled = False
+                    self.simulated = False
+                raise RuntimeError(
+                    f"Unable to reconcile broker orders (HTTP {response.status})."
+                )
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logger.error("Unable to reconcile broker orders: %s", exc)
+            raise RuntimeError("Broker order state is unknown; trading must halt.") from exc
 
     async def cancel_order(self, order_id: str) -> Dict[str, Any]:
         if self.simulated:
@@ -369,16 +391,36 @@ class AlpacaClient:
             async with session.delete(
                 f"{self.base_url}/v2/orders/{order_id}", headers=self.headers
             ) as response:
-                if response.status in {200, 201}:
-                    return {"success": True, "order_id": order_id}
+                if response.status in {200, 201, 204}:
+                    return {"success": True, "order_id": order_id, "status": "CANCEL_REQUEST_ACCEPTED"}
+                if response.status == 401:
+                    self.enabled = False
+                    self.simulated = False
+                    return {"success": False, "status": "UNAUTHORIZED", "error": "Broker credentials rejected."}
+                if response.status == 404:
+                    return {
+                        "success": False,
+                        "status": "ORDER_NOT_FOUND",
+                        "error": "Broker did not find the order; reconcile order and position state.",
+                        "reconciliation_required": True,
+                    }
                 data = await response.json()
                 return {
                     "success": False,
+                    "status": "CANCEL_REJECTED",
                     "error": data.get("message", "Unable to cancel order"),
                 }
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            logger.warning(f"Order cancel failed: {e}")
-            return {"success": False, "error": str(e)}
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logger.critical("Order cancellation outcome unknown for %s: %s", order_id, exc)
+            self.enabled = False
+            self.simulated = False
+            return {
+                "success": False,
+                "status": "CANCEL_OUTCOME_UNKNOWN",
+                "error": "Cancellation outcome unknown; trading halted until broker state is reconciled.",
+                "reconciliation_required": True,
+                "trading_halted": True,
+            }
 
     async def get_assets(
         self,
@@ -537,13 +579,12 @@ class AlpacaClient:
                                 )
                                 break
                             if response.status == 401:
-                                logger.warning(
-                                    "Alpaca API Keys invalid (401). Falling back to full simulation mode."
+                                self.enabled = False
+                                self.simulated = False
+                                logger.critical(
+                                    "Alpaca market-data credentials rejected (401); refusing synthetic-data substitution."
                                 )
-                                self.simulated = True
-                                return await self.get_bars(
-                                    symbol, timeframe, limit, start, feed
-                                )
+                                raise RuntimeError("Alpaca market-data credentials rejected (401).")
                             logger.warning(
                                 f"Alpaca bars request for {symbol} returned HTTP {response.status}: {await response.text()}"
                             )
@@ -571,7 +612,8 @@ class AlpacaClient:
                 # Save to persistent SQLite cache
                 db_cache.save_bars(symbol, timeframe, bars)
             elif cached_bars:
-                # Return partial cache if fetch failed or rate limited
+                # Cached bars may still be used for research signals, but the
+                # pre-trade guard independently enforces the live timestamp SLA.
                 return cached_bars
             return bars
         finally:
@@ -591,12 +633,28 @@ class AlpacaClient:
             async with session.delete(
                 f"{self.base_url}/v2/positions/{symbol}", headers=self.headers
             ) as response:
-                if response.status in {200, 201}:
-                    return {"success": True, "symbol": symbol}
-                return {"success": False, "error": "Failed to close"}
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            logger.warning(f"Failed to close position for {symbol}: {e}")
-            return {"success": False, "error": str(e)}
+                if response.status in {200, 201, 204}:
+                    return {"success": True, "symbol": symbol, "status": "CLOSE_REQUEST_ACCEPTED"}
+                if response.status == 401:
+                    self.enabled = False
+                    self.simulated = False
+                    return {"success": False, "status": "UNAUTHORIZED", "error": "Broker credentials rejected."}
+                return {
+                    "success": False,
+                    "status": "CLOSE_REJECTED",
+                    "error": f"Broker close request rejected (HTTP {response.status}).",
+                }
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logger.critical("Close outcome unknown for %s: %s", symbol, exc)
+            self.enabled = False
+            self.simulated = False
+            return {
+                "success": False,
+                "status": "CLOSE_OUTCOME_UNKNOWN",
+                "error": "Close request outcome unknown; trading halted until reconciliation.",
+                "reconciliation_required": True,
+                "trading_halted": True,
+            }
 
     def _generate_synthetic_bars(
         self, symbol: str, timeframe: str, limit: int
