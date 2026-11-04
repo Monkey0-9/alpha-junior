@@ -8,6 +8,7 @@ from nexus.features.features import FeatureEngineer
 from nexus.models.zoo.time_series import GradientBoostedTimeSeriesModel
 
 from nexus.research.walk_forward import WalkForwardEvaluator
+from nexus.utils.config import Config
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +101,15 @@ class ModelRegistry:
             "out_of_sample_samples": res.get("out_of_sample_samples", 0),
         }
 
+        # Model evaluation is useful research, but it must not silently
+        # replace the serving model. Promotion is a separate, explicit release
+        # operation after artifact persistence, calibration, approval and rollback.
+        if not Config.AUTO_MODEL_PROMOTION_ENABLED:
+            logger.info(
+                "Candidate evaluated but not promoted: NEXUS_AUTO_MODEL_PROMOTION is disabled."
+            )
+            return False, candidate_metrics
+
         # Institutional promotion gating:
         # Candidate Sharpe must beat active Sharpe by >= 0.10, Profit Factor >
         # 1.05, Max DD < 25%
@@ -144,6 +154,8 @@ class ContinuousLearner:
         self.retrain_interval = 3600.0 * 6  # Retrain every 6 hours
 
     def step_retrain(self, historical_bars: pd.DataFrame) -> bool:
+        if not Config.AUTO_RETRAIN_ENABLED:
+            return False
         now = time.time()
         if now - self.last_retrain_time < self.retrain_interval:
             return False
