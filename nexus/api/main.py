@@ -5,15 +5,13 @@ from contextlib import asynccontextmanager
 from typing import Dict, AsyncGenerator, Callable, Awaitable, Any
 import logging
 import os
+import hmac
 from nexus.api.alpaca_router import router as alpaca_router
 from nexus.api.monitor_router import router as monitor_router
 from nexus.execution.alpaca import get_client
 from nexus.utils.config import Config
 
 logger = logging.getLogger(__name__)
-
-# API key loaded once at import time
-_API_KEY = os.getenv("NEXUS_API_KEY", "")
 
 
 @asynccontextmanager
@@ -55,32 +53,40 @@ app = FastAPI(
 )
 
 
-# --- API Key Authentication Middleware ---
+# --- Fail-closed API authentication middleware ---
 @app.middleware("http")
 async def api_key_auth(
     request: Request, call_next: Callable[[Request], Awaitable[Any]]
 ) -> Any:
-    """Verify X-API-Key header on mutation endpoints."""
-    # Skip auth for health checks and GET-only read endpoints
-    logger.info(f"API Request: {request.method} {request.url.path}")
-    safe_paths = {"/docs", "/openapi.json", "/api/alpaca/health"}
-    if request.url.path in safe_paths:
-        logger.info(f"Safe path detected: {request.url.path}")
+    """Require a strong API key for every non-liveness route."""
+    logger.info("API request: %s %s", request.method, request.url.path)
+
+    # CORS preflight and liveness endpoints expose no account or trading data.
+    safe_paths = {"/api/health", "/api/alpaca/health", "/api/monitor/health"}
+    if request.method == "OPTIONS" or request.url.path in safe_paths:
         return await call_next(request)
 
-    # If no API key is configured, skip auth (dev mode)
-    if not _API_KEY:
-        return await call_next(request)
+    expected_key = os.getenv("NEXUS_API_KEY", "").strip()
+    placeholders = {
+        "changeme",
+        "your_api_key",
+        "your_secure_api_key",
+        "generate_a_secure_random_key_for_internal_auth",
+    }
+    if len(expected_key) < 32 or expected_key.lower() in placeholders:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "API authentication is not configured with a strong NEXUS_API_KEY."},
+        )
 
-    # Enforce auth on POST, DELETE, PUT, PATCH
-    if request.method in {"POST", "DELETE", "PUT", "PATCH"}:
-        provided_key = request.headers.get("X-API-Key", "")
-        if provided_key != _API_KEY:
-            return JSONResponse(
-                status_code=401,
-                content={"detail": "Invalid or missing API key"},
-            )
-
+    provided_key = request.headers.get("X-API-Key", "")
+    if not provided_key or not hmac.compare_digest(
+        provided_key.encode("utf-8"), expected_key.encode("utf-8")
+    ):
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Invalid or missing API key"},
+        )
     return await call_next(request)
 
 
@@ -101,55 +107,12 @@ app.add_middleware(
 
 @app.get("/api/health")
 async def health() -> Dict[str, Any]:
-    checks: Dict[str, Any] = {
-        "api": "healthy",
-        "database": "unknown",
-        "broker": "unknown",
-    }
-    overall_status = "healthy"
-
-    # 1. Database check
-    try:
-        from pathlib import Path
-        import sqlite3
-
-        db_path = Path("data/nexus_audit.db")
-        if not db_path.exists():
-            checks["database"] = "uninitialized"
-            overall_status = "degraded"
-        else:
-            conn = sqlite3.connect(str(db_path), timeout=2)
-            conn.execute("SELECT 1 FROM audit_log LIMIT 1")
-            conn.close()
-            checks["database"] = "healthy"
-    except Exception as exc:
-        checks["database"] = f"error: {str(exc)}"
-        overall_status = "degraded"
-
-    # 2. Broker connection check
-    try:
-        client = get_client()
-        if not client.enabled:
-            checks["broker"] = "disabled"
-            overall_status = "degraded"
-        elif client.simulated:
-            checks["broker"] = "simulated"
-        else:
-            acc = await client.get_account()
-            if acc.get("status") in {"ACTIVE", "healthy"}:
-                checks["broker"] = "connected"
-            else:
-                checks["broker"] = acc.get("status", "error")
-                overall_status = "degraded"
-    except Exception as exc:
-        checks["broker"] = f"error: {str(exc)}"
-        overall_status = "degraded"
-
+    """Unauthenticated liveness probe; dependency readiness stays private."""
     return {
-        "status": overall_status,
+        "status": "alive",
         "service": "Nexus Institutional API",
         "version": "2.0.0",
-        "checks": checks,
+        "checks": {"api": "healthy"},
     }
 
 
