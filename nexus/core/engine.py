@@ -65,7 +65,8 @@ class NexusEngine:
         # PERF FIX: Persistent client for connection pooling
         self._client: Optional[httpx.AsyncClient] = None
         # Tracking Submitted Orders
-        self._active_orders: Dict[str, str] = {}  # symbol -> order_id
+        self._active_orders: Dict[str, str] = {}  # symbol -> broker order id
+        self._active_client_order_ids: Dict[str, str] = {}
         self._execution_halted = ExecutionHaltState.is_halted()
         self._cycle_id = uuid.uuid4().hex
 
@@ -180,47 +181,69 @@ class NexusEngine:
             logger.error("Unable to reach execution backend.")
             return False
 
-        # On process start, recover the broker's working orders before the
-        # scheduler can create a new intent. An unavailable orders endpoint is
-        # not evidence that the broker has no open orders.
-        if not self._execution_halted and not ExecutionHaltState.is_halted():
-            try:
-                orders_response = await client.get(
-                    f"{self.backend_url}/api/alpaca/orders",
-                    params={"status": "open", "limit": 500},
+        # Recover unresolved application intents and broker working orders before
+        # any scheduler cycle can create a new entry.
+        try:
+            unresolved_intents = self.governance.list_unresolved_order_intents()
+            for intent in unresolved_intents:
+                self._trip_execution_halt(
+                    f"Unresolved durable order intent on startup (status={intent.get('status')}).",
+                    symbol=intent.get("symbol"),
+                    order_id=intent.get("broker_order_id") or intent.get("client_order_id"),
                 )
-                orders_response.raise_for_status()
-                orders_payload = orders_response.json()
-                open_orders = orders_payload.get("orders")
-                if not isinstance(open_orders, list):
-                    raise RuntimeError("Broker open-orders response is malformed.")
-                terminal_statuses = {"filled", "canceled", "cancelled", "expired", "rejected"}
-                for order in open_orders:
-                    if not isinstance(order, dict):
-                        raise RuntimeError("Broker returned malformed open-order record.")
-                    order_id = order.get("id") or order.get("order_id")
-                    symbol = order.get("symbol")
-                    status = str(order.get("status", "")).lower()
-                    if status in terminal_statuses:
-                        continue
-                    if not order_id or not symbol:
-                        raise RuntimeError("Open order is missing broker order ID or symbol.")
-                    self._active_orders[str(symbol).upper()] = str(order_id)
-                    self._trip_execution_halt(
-                        f"Broker has an unresolved open order on startup (status={status or 'UNKNOWN'}).",
-                        symbol=str(symbol).upper(),
-                        order_id=str(order_id),
-                    )
-            except Exception as exc:
-                logger.critical(
-                    "Startup broker order reconciliation failed; engine cannot enable entries: %s",
-                    exc,
+                if intent.get("broker_order_id") and intent.get("symbol"):
+                    symbol = str(intent["symbol"]).upper()
+                    self._active_orders[symbol] = str(intent["broker_order_id"])
+                    self._active_client_order_ids[symbol] = str(intent["client_order_id"])
+        except Exception as exc:
+            logger.critical(
+                "Unable to read durable order-intent ledger; engine remains halted: %s",
+                exc,
+            )
+            self._trip_execution_halt("Order-intent ledger unavailable on startup.")
+            return False
+
+        try:
+            orders_response = await client.get(
+                f"{self.backend_url}/api/alpaca/orders",
+                params={"status": "open", "limit": 500},
+            )
+            orders_response.raise_for_status()
+            orders_payload = orders_response.json()
+            open_orders = orders_payload.get("orders")
+            if not isinstance(open_orders, list):
+                raise RuntimeError("Broker open-orders response is malformed.")
+
+            for order in open_orders:
+                if not isinstance(order, dict):
+                    raise RuntimeError("Broker returned malformed open-order record.")
+                order_id = order.get("id") or order.get("order_id")
+                symbol = order.get("symbol")
+                status = str(order.get("status", "")).lower()
+                if status in {"filled", "canceled", "cancelled", "expired", "rejected"}:
+                    continue
+                if not order_id or not symbol:
+                    raise RuntimeError("Open order lacks broker order ID or symbol.")
+                normalized_symbol = str(symbol).upper()
+                self._active_orders[normalized_symbol] = str(order_id)
+                client_order_id = order.get("client_order_id")
+                if client_order_id:
+                    self._active_client_order_ids[normalized_symbol] = str(client_order_id)
+                self._trip_execution_halt(
+                    f"Broker working order found on startup (status={status or 'UNKNOWN'}).",
+                    symbol=normalized_symbol,
+                    order_id=str(order_id),
                 )
-                self.health_monitor.record(
-                    "broker", False, details="Startup open-order reconciliation failed"
-                )
-                self.health_monitor.heartbeat()
-                return False
+        except Exception as exc:
+            logger.critical(
+                "Startup broker order reconciliation failed; engine cannot enable entries: %s",
+                exc,
+            )
+            self.health_monitor.record(
+                "broker", False, details="Startup open-order reconciliation failed"
+            )
+            self.health_monitor.heartbeat()
+            return False
 
         # High-speed Go Audit
         audit = PolyglotBridge.audit_platform_go(self.backend_url)
@@ -383,12 +406,18 @@ class NexusEngine:
         self.health_monitor.heartbeat()
 
     async def _verify_order_fills(self) -> None:
-        """Resolve order lifecycle states; unknown/404 outcomes trip persistent halt."""
+        """Reconcile all tracked orders and update their durable intent records."""
         if not self._active_orders:
             return
 
         client = await self._get_client()
-        terminal_statuses = {"filled", "canceled", "cancelled", "expired", "rejected"}
+        terminal_statuses = {
+            "filled": "FILLED",
+            "canceled": "CANCELLED",
+            "cancelled": "CANCELLED",
+            "expired": "EXPIRED",
+            "rejected": "REJECTED",
+        }
         for symbol, order_id in list(self._active_orders.items()):
             try:
                 response = await client.get(
@@ -396,7 +425,7 @@ class NexusEngine:
                 )
                 if response.status_code != 200:
                     self._trip_execution_halt(
-                        f"Unable to reconcile order (HTTP {response.status_code}).",
+                        f"Unable to reconcile broker order (HTTP {response.status_code}).",
                         symbol=symbol,
                         order_id=order_id,
                     )
@@ -406,26 +435,47 @@ class NexusEngine:
                 status = str(
                     order_info.get("status") or order_info.get("order_status") or ""
                 ).lower()
+                client_order_id = (
+                    order_info.get("client_order_id")
+                    or self._active_client_order_ids.get(symbol)
+                )
+                if client_order_id:
+                    try:
+                        if status in terminal_statuses:
+                            self.governance.update_order_intent(
+                                client_order_id,
+                                terminal_statuses[status],
+                                broker_order_id=order_id,
+                            )
+                        elif status in {"partially_filled", "partial_fill"}:
+                            self.governance.update_order_intent(
+                                client_order_id,
+                                "PARTIALLY_FILLED",
+                                broker_order_id=order_id,
+                            )
+                    except Exception as exc:
+                        self._trip_execution_halt(
+                            f"Could not durably update order intent after broker status {status}: {exc}",
+                            symbol=symbol,
+                            order_id=order_id,
+                        )
+                        continue
+
                 if status in terminal_statuses:
                     logger.info("Order %s for %s finalized: %s", order_id, symbol, status)
                     self._active_orders.pop(symbol, None)
+                    self._active_client_order_ids.pop(symbol, None)
                 else:
-                    # Any non-terminal broker state must survive process restarts.
                     logger.warning(
-                        "Order %s for %s is unresolved (status=%s); tripping persistent halt.",
+                        "Order %s for %s remains unresolved (status=%s). New entries are blocked.",
                         order_id,
                         symbol,
                         status or "UNKNOWN",
                     )
-                    self._trip_execution_halt(
-                        f"Open or partially filled broker order remains unresolved (status={status or 'UNKNOWN'}).",
-                        symbol=symbol,
-                        order_id=order_id,
-                    )
             except Exception as exc:
-                logger.error("Error reconciling order %s for %s: %s", order_id, symbol, exc)
+                logger.error("Order reconciliation failed for %s (%s): %s", symbol, order_id, exc)
                 self._trip_execution_halt(
-                    "Order lifecycle reconciliation failed.",
+                    "Broker order lifecycle reconciliation failed.",
                     symbol=symbol,
                     order_id=order_id,
                 )
@@ -793,6 +843,9 @@ class NexusEngine:
                     )
                     return
                 self._active_orders[symbol] = str(order_id)
+                self._active_client_order_ids[symbol] = str(
+                    response_payload.get("client_order_id") or client_order_id
+                )
                 logger.info(
                     "Order submitted for %s: id=%s status=%s",
                     symbol,
