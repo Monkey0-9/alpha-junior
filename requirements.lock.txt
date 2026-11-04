@@ -563,7 +563,6 @@ s3transfer==0.16.0
 safetensors==0.7.0
 safety==3.7.0
 safety-schemas==0.0.16
--e git+https://github.com/Monkey0-9/bloomb_mini.git@8988f5c275f974ee40afbdeba43cc17ce0a988b6#egg=satellite_trade
 scikit-base==0.13.0
 scikit-image==0.26.0
 scikit-learn==1.8.0
