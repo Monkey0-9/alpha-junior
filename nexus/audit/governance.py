@@ -354,6 +354,34 @@ class GovernanceEngine:
         result["_created"] = True
         return result
 
+    def update_trade_order_status(
+        self,
+        client_order_id: str,
+        status: str,
+        *,
+        broker_order_id: Optional[str] = None,
+        qty: Optional[float] = None,
+        price: Optional[float] = None,
+    ) -> None:
+        """Update the durable order ledger after broker partial/terminal status changes."""
+        try:
+            self._db.execute(
+                "UPDATE trade_history SET status = ?, "
+                "order_id = COALESCE(?, order_id), "
+                "qty = COALESCE(?, qty), "
+                "price = COALESCE(?, price) "
+                "WHERE client_order_id = ?",
+                (status, broker_order_id, qty, price, client_order_id),
+            )
+            self._db.commit()
+        except sqlite3.Error as exc:
+            try:
+                self._db.rollback()
+            except sqlite3.Error:
+                pass
+            logger.critical("Trade status update failed for %s: %s", client_order_id, exc)
+            raise RuntimeError("Unable to persist broker trade status.") from exc
+
     def has_trade_record(self, client_order_id: str) -> bool:
         row = self._db.execute(
             "SELECT 1 FROM trade_history WHERE client_order_id = ? LIMIT 1",
