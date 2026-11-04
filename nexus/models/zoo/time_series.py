@@ -1,4 +1,5 @@
 import logging
+import importlib
 import numpy as np
 import pandas as pd
 from typing import Dict, Tuple, Any
@@ -10,10 +11,9 @@ nn: Any = None
 optim: Any = None
 
 try:
-    import torch
-    import torch.nn as nn
-    import torch.optim as optim
-
+    torch = importlib.import_module("torch")
+    nn = importlib.import_module("torch.nn")
+    optim = importlib.import_module("torch.optim")
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
@@ -205,10 +205,13 @@ class PyTorchLSTMModel:
             return np.array([]), np.array([])
 
         df_copy = df.copy()
-        df_copy["target"] = np.where(
-            df_copy["close"].shift(-1) > df_copy["close"], 1, 0
+        current_close = pd.to_numeric(df_copy["close"], errors="coerce")
+        future_close = current_close.shift(-1)
+        df_copy["target"] = np.where(future_close > current_close, 1, 0)
+        df_copy.loc[future_close.isna(), "target"] = np.nan
+        df_clean = df_copy.replace([np.inf, -np.inf], np.nan).dropna(
+            subset=available_cols + ["close", "target"]
         )
-        df_clean = df_copy.dropna(subset=available_cols + ["target"])
 
         if len(df_clean) < self.sequence_length + 5:
             return np.array([]), np.array([])
@@ -338,10 +341,13 @@ class TemporalTransformerModel:
                 return self.tree_fallback.fit(df)
 
             df_copy = df.copy()
-            df_copy["target"] = np.where(
-                df_copy["close"].shift(-1) > df_copy["close"], 1, 0
+            current_close = pd.to_numeric(df_copy["close"], errors="coerce")
+            future_close = current_close.shift(-1)
+            df_copy["target"] = np.where(future_close > current_close, 1, 0)
+            df_copy.loc[future_close.isna(), "target"] = np.nan
+            df_clean = df_copy.replace([np.inf, -np.inf], np.nan).dropna(
+                subset=available_cols + ["close", "target"]
             )
-            df_clean = df_copy.dropna(subset=available_cols + ["target"])
 
             if len(df_clean) < self.sequence_length + 5:
                 return self.tree_fallback.fit(df)
