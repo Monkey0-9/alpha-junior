@@ -1,6 +1,8 @@
 import json
 import os
 import platform
+import math
+import re
 import shutil
 import subprocess  # nosec B404
 import logging
@@ -17,38 +19,51 @@ class PolyglotBridge:
         returns: List[float],
         conf: float = 0.95,
     ) -> Dict[str, Any]:
-        """Execute Rust Risk Engine for VaR calculation."""
-        input_data = json.dumps({"returns": returns, "confidence_level": conf})
+        """Run the Rust risk kernel; unavailable results are never represented as zero."""
+        if not returns:
+            return {"var": None, "expected_shortfall": None, "status": "INVALID_INPUT"}
         try:
+            numeric_returns = [float(value) for value in returns]
+            if not all(math.isfinite(value) for value in numeric_returns):
+                return {"var": None, "expected_shortfall": None, "status": "INVALID_INPUT"}
+            confidence = float(conf)
+            if not math.isfinite(confidence) or not 0.0 < confidence < 1.0:
+                return {"var": None, "expected_shortfall": None, "status": "INVALID_CONFIDENCE"}
             if not shutil.which("cargo"):
-                return {
-                    "var": 0.0,
-                    "expected_shortfall": 0.0,
-                    "status": "RUST_NOT_INSTALLED",
-                }
+                return {"var": None, "expected_shortfall": None, "status": "RUST_NOT_INSTALLED"}
 
-            cmd = [
-                "cargo",
-                "run",
-                "--quiet",
-                "--manifest-path",
-                "nexus/polyglot/rust_risk_engine/Cargo.toml",
-                "--",
-                input_data,
-            ]
-            result = subprocess.run(  # nosec B603
-                cmd,
-                capture_output=True,
-                text=True,
-                check=True,
+            input_data = json.dumps(
+                {"returns": numeric_returns, "confidence_level": confidence},
+                allow_nan=False,
             )
-            return cast(Dict[str, Any], json.loads(result.stdout))
-        except Exception as exc:
-            logger.debug(f"Rust Risk Engine fallback: {exc}")
+            command = [
+                "cargo", "run", "--quiet", "--manifest-path",
+                "nexus/polyglot/rust_risk_engine/Cargo.toml", "--", input_data,
+            ]
+            result = subprocess.run(
+                command, capture_output=True, text=True, check=True, timeout=30
+            )
+            payload = json.loads(result.stdout)
+            var_value = payload.get("var")
+            es_value = payload.get("expected_shortfall")
+            if var_value is None or es_value is None:
+                raise ValueError("Rust risk engine returned incomplete metrics.")
+            var_number = float(var_value)
+            es_number = float(es_value)
+            if not math.isfinite(var_number) or not math.isfinite(es_number):
+                raise ValueError("Rust risk engine returned non-finite metrics.")
             return {
-                "var": 0.0,
-                "expected_shortfall": 0.0,
-                "status": "FALLBACK",
+                "var": var_number,
+                "expected_shortfall": es_number,
+                "status": "OK",
+            }
+        except Exception as exc:
+            logger.error("Rust risk calculation unavailable: %s", exc)
+            return {
+                "var": None,
+                "expected_shortfall": None,
+                "status": "RUST_ERROR",
+                "error": str(exc),
             }
 
     @staticmethod
@@ -87,73 +102,89 @@ class PolyglotBridge:
             return {"overall_health": "UNKNOWN", "results": []}
 
     @staticmethod
-    def validate_order_zig(
-        order: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """Execute Zig Validator for order verification with fail-closed safety."""
-        strict_polyglot = os.getenv("NEXUS_STRICT_POLYGLOT", "false").lower() in ("true", "1", "yes")
+    def validate_order_zig(order: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply a strict Python order schema, with optional native Zig verification."""
+        strict_polyglot = os.getenv("NEXUS_STRICT_POLYGLOT", "false").strip().lower() in {
+            "true", "1", "yes"
+        }
 
-        # 1. Structural schema and bounds pre-validation (defense-in-depth)
-        qty = order.get("qty", 0)
-        price = order.get("price", 0.0)
-        symbol = order.get("symbol", "")
+        symbol = order.get("symbol")
+        if (
+            not isinstance(symbol, str)
+            or symbol != symbol.strip()
+            or symbol != symbol.upper()
+            or not re.fullmatch(r"[A-Z][A-Z0-9.-]{0,15}", symbol)
+        ):
+            return {"valid": False, "error": "Symbol must be uppercase and match the allowed format."}
 
-        try:
-            qty_val = float(qty)
-            if qty_val <= 0:
-                return {"valid": False, "error": "Quantity must be positive"}
-        except (ValueError, TypeError):
-            return {"valid": False, "error": "Invalid quantity specification"}
+        side = order.get("side")
+        if side not in {"buy", "sell"}:
+            return {"valid": False, "error": "Side must be buy or sell."}
 
-        try:
-            price_val = float(price)
-            if price_val <= 0.0:
-                return {"valid": False, "error": "Price must be positive"}
-        except (ValueError, TypeError):
-            return {"valid": False, "error": "Invalid price specification"}
+        def finite_positive(value: Any, field: str) -> Optional[str]:
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return f"{field} must be numeric."
+            if not math.isfinite(number) or number <= 0:
+                return f"{field} must be finite and positive."
+            return None
 
-        if not symbol or not isinstance(symbol, str) or not symbol.strip():
-            return {"valid": False, "error": "Symbol must be non-empty string"}
+        for field in ("qty", "price"):
+            error = finite_positive(order.get(field), field)
+            if error:
+                return {"valid": False, "error": error}
 
-        # 2. Native Zig verification
-        if not shutil.which("zig"):
-            if strict_polyglot:
-                logger.error("[PolyglotBridge] Strict mode: Zig compiler not found. Failing closed.")
+        order_type = order.get("order_type", "market")
+        if order_type not in {"market", "limit", "stop", "stop_limit", "trailing_stop"}:
+            return {"valid": False, "error": "Unsupported order type."}
+
+        for field in ("limit_price", "stop_price", "trail_price", "trail_percent"):
+            value = order.get(field)
+            if value is not None:
+                error = finite_positive(value, field)
+                if error:
+                    return {"valid": False, "error": error}
+
+        if order_type in {"limit", "stop_limit"} and order.get("limit_price") is None:
+            return {"valid": False, "error": "Limit orders require limit_price."}
+        if order_type in {"stop", "stop_limit"} and order.get("stop_price") is None:
+            return {"valid": False, "error": "Stop orders require stop_price."}
+        if order_type == "trailing_stop":
+            has_price = order.get("trail_price") is not None
+            has_percent = order.get("trail_percent") is not None
+            if has_price == has_percent:
                 return {
                     "valid": False,
-                    "error": "ZIG_NOT_INSTALLED_FAIL_CLOSED",
+                    "error": "Trailing stops require exactly one trail_price or trail_percent.",
                 }
-            return {
-                "valid": True,
-                "error": None,
-                "source": "FALLBACK_VERIFIED",
-            }
+
+        # Python validation is mandatory. Zig is an additional independent check.
+        if not shutil.which("zig"):
+            if strict_polyglot:
+                return {"valid": False, "error": "ZIG_NOT_INSTALLED_FAIL_CLOSED"}
+            return {"valid": True, "error": None, "source": "PYTHON_STRICT_VALIDATOR"}
 
         try:
-            input_data = json.dumps(order)
-            cmd = [
-                "zig",
-                "run",
-                "nexus/polyglot/zig_validator/main.zig",
-                "--",
-                input_data,
-            ]
-            result = subprocess.run(  # nosec B603
-                cmd,
+            input_data = json.dumps(order, allow_nan=False)
+            result = subprocess.run(
+                [
+                    "zig", "run", "nexus/polyglot/zig_validator/main.zig",
+                    "--", input_data,
+                ],
                 capture_output=True,
                 text=True,
                 check=True,
+                timeout=10,
             )
-            return cast(Dict[str, Any], json.loads(result.stdout))
+            native = json.loads(result.stdout)
+            if not isinstance(native, dict) or not isinstance(native.get("valid"), bool):
+                raise ValueError("Zig validator returned a malformed response.")
+            if native["valid"] is not True:
+                return {"valid": False, "error": native.get("error", "ZIG_VALIDATION_FAILED")}
+            return {"valid": True, "error": None, "source": "PYTHON_AND_ZIG"}
         except Exception as exc:
-            logger.debug(f"Zig Validator execution error: {exc}")
+            logger.warning("Zig validator unavailable or failed: %s", exc)
             if strict_polyglot:
-                return {
-                    "valid": False,
-                    "error": f"VALIDATOR_OFFLINE_FAIL_CLOSED: {exc}",
-                }
-            return {
-                "valid": True,
-                "error": None,
-                "source": "FALLBACK_VERIFIED",
-            }
+                return {"valid": False, "error": f"VALIDATOR_OFFLINE_FAIL_CLOSED: {exc}"}
+            return {"valid": True, "error": None, "source": "PYTHON_STRICT_VALIDATOR_FALLBACK"}
