@@ -240,12 +240,13 @@ class NexusEngine:
                             mapped_status,
                             broker_order_id=str(order_id),
                         )
+                        filled_price = order.get("filled_avg_price")
+                        filled_qty = order.get("filled_qty") or order.get("qty") or intent["qty"]
                         if not self.governance.has_trade_record(str(client_order_id)):
-                            filled_price = order.get("filled_avg_price")
                             self.governance.record_trade({
                                 "symbol": str(symbol).upper(),
                                 "side": str(order.get("side", intent["side"])).lower(),
-                                "qty": float(order.get("filled_qty") or order.get("qty") or intent["qty"]),
+                                "qty": float(filled_qty),
                                 "price": float(filled_price) if filled_price is not None else None,
                                 "order_type": str(order.get("type") or intent["order_type"]),
                                 "strategy": intent.get("strategy"),
@@ -254,6 +255,14 @@ class NexusEngine:
                                 "client_order_id": str(client_order_id),
                                 "intent_id": str(client_order_id),
                             })
+                        else:
+                            self.governance.update_trade_order_status(
+                                str(client_order_id),
+                                mapped_status,
+                                broker_order_id=str(order_id),
+                                qty=float(filled_qty) if filled_qty is not None else None,
+                                price=float(filled_price) if filled_price is not None else None,
+                            )
                     else:
                         self.governance.update_order_intent(
                             str(client_order_id),
@@ -512,17 +521,38 @@ class NexusEngine:
                 if client_order_id:
                     try:
                         if status in terminal_statuses:
+                            terminal_state = terminal_statuses[status]
                             self.governance.update_order_intent(
                                 client_order_id,
-                                terminal_statuses[status],
+                                terminal_state,
                                 broker_order_id=order_id,
                             )
+                            if self.governance.has_trade_record(client_order_id):
+                                filled_qty = order_info.get("filled_qty")
+                                filled_price = order_info.get("filled_avg_price")
+                                self.governance.update_trade_order_status(
+                                    client_order_id,
+                                    terminal_state,
+                                    broker_order_id=order_id,
+                                    qty=float(filled_qty) if filled_qty is not None else None,
+                                    price=float(filled_price) if filled_price is not None else None,
+                                )
                         elif status in {"partially_filled", "partial_fill"}:
                             self.governance.update_order_intent(
                                 client_order_id,
                                 "PARTIALLY_FILLED",
                                 broker_order_id=order_id,
                             )
+                            if self.governance.has_trade_record(client_order_id):
+                                filled_qty = order_info.get("filled_qty")
+                                filled_price = order_info.get("filled_avg_price")
+                                self.governance.update_trade_order_status(
+                                    client_order_id,
+                                    "PARTIALLY_FILLED",
+                                    broker_order_id=order_id,
+                                    qty=float(filled_qty) if filled_qty is not None else None,
+                                    price=float(filled_price) if filled_price is not None else None,
+                                )
                     except Exception as exc:
                         self._trip_execution_halt(
                             f"Could not durably update order intent after broker status {status}: {exc}",
