@@ -1,3 +1,7 @@
+> **SUPERSEDED — NOT A PRODUCTION READINESS CERTIFICATE (5 November 2026).** This document contains historical setup notes and/or claims about a machine-specific deployment that have not been re-verified against the current repository. Do not rely on its “active”, “complete”, “production ready”, “24/7”, or unauthenticated-endpoint statements. Current release status is **NOT PRODUCTION CERTIFIED**. See [docs/ALPHA_JUNIOR_RELEASE_AUDIT_2026-11-05.md](docs/ALPHA_JUNIOR_RELEASE_AUDIT_2026-11-05.md), [docs/EXECUTION_AUTOMATION_SPEC.md](docs/EXECUTION_AUTOMATION_SPEC.md), and [README.md](README.md). Live trading and worldwide deployment require the release gates to pass on the exact deployment artifact.
+
+---
+
 # ✅ NEXUS PLATFORM - COMPLETE DEPLOYMENT SUCCESS
 
 ## 🎯 STATUS: FULLY OPERATIONAL

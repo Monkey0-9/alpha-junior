@@ -1,5 +1,7 @@
 import pytest
 import numpy as np
+from datetime import datetime, timezone
+from unittest.mock import AsyncMock
 
 from nexus.risk.pre_trade_guard import PreTradeRiskGuard
 from nexus.execution.alpaca import AlpacaClient, AlpacaCredentials
@@ -21,6 +23,7 @@ async def test_pre_trade_guard_rejects_unauthenticated_broker() -> None:
         "qty": 10,
         "side": "buy",
         "price": 150.0,
+        "client_order_id": "test-order-disabled-0001",
     }
 
     result = await guard.validate_and_submit(client=client, order_request=order_req)
@@ -36,13 +39,26 @@ async def test_pre_trade_guard_governance_concentration() -> None:
     client = AlpacaClient(credentials=AlpacaCredentials("KEY", "SECRET"))
     client.enabled = True
     client.simulated = False  # Live broker mode
+    client.get_account = AsyncMock(return_value={
+        "enabled": True,
+        "simulated": False,
+        "status": "ACTIVE",
+        "equity": 100000.0,
+        "last_equity": 101000.0,
+    })
+    client.get_positions = AsyncMock(return_value=[])
+    client.get_bars = AsyncMock(return_value=[{
+        "t": datetime.now(timezone.utc).isoformat(),
+        "close": 100.0,
+    }])
 
-    # Order value = 300 * $100 = $30,000, which is 30% of $100,000 equity (exceeds 20% max)
+    # Order value = 300 * $100 = $30,000, which is 30% of $100,000 equity.
     oversized_order = {
         "symbol": "TSLA",
         "qty": 300,
         "side": "buy",
         "price": 100.0,
+        "client_order_id": "test-order-concentration-001",
     }
 
     empty_pos: list[dict[str, object]] = []
@@ -124,7 +140,7 @@ def test_polyglot_zig_validation_defense_in_depth() -> None:
     assert "symbol" in res3["error"].lower()
 
     # Valid Order
-    res4 = PolyglotBridge.validate_order_zig({"symbol": "AAPL", "qty": 10, "price": 150.0})
+    res4 = PolyglotBridge.validate_order_zig({"symbol": "AAPL", "qty": 10, "price": 150.0, "side": "buy"})
     assert res4["valid"] is True
 
 

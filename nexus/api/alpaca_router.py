@@ -1,6 +1,6 @@
-from fastapi import APIRouter, HTTPException, Depends
-from typing import Optional, Dict, Any
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException, Depends, Query, Header
+from typing import Optional, Dict, Any, Literal
+from pydantic import BaseModel, Field, ConfigDict
 import logging
 from nexus.execution.alpaca import get_client, AlpacaClient
 from nexus.utils.config import Config
@@ -12,18 +12,20 @@ router = APIRouter(prefix="/api/alpaca", tags=["execution"])
 
 
 class OrderRequest(BaseModel):
-    symbol: str
-    qty: float
-    side: str
-    asset_class: str = "equity"
-    strategy: Optional[str] = None
-    order_type: str = "market"
-    time_in_force: str = "day"
-    limit_price: Optional[float] = None
-    stop_price: Optional[float] = None
-    trail_price: Optional[float] = None
-    trail_percent: Optional[float] = None
-    client_order_id: Optional[str] = None
+    model_config = ConfigDict(extra="forbid")
+
+    symbol: str = Field(min_length=1, max_length=16, pattern=r"^[A-Za-z][A-Za-z0-9.-]*$")
+    qty: float = Field(gt=0, allow_inf_nan=False)
+    side: Literal["buy", "sell"]
+    asset_class: Literal["equity"] = "equity"
+    strategy: Optional[str] = Field(default=None, max_length=100)
+    order_type: Literal["market", "limit", "stop", "stop_limit", "trailing_stop"] = "market"
+    time_in_force: Literal["day", "gtc", "opg", "cls", "ioc", "fok"] = "day"
+    limit_price: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
+    stop_price: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
+    trail_price: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
+    trail_percent: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
+    client_order_id: str = Field(min_length=16, max_length=32, pattern=r"^[A-Za-z0-9._-]+$")
     extended_hours: bool = False
 
 
@@ -34,6 +36,22 @@ async def get_alpaca() -> AlpacaClient:
             status_code=503, detail="Alpaca execution is not configured."
         )
     return client
+
+
+def _order_result_or_raise(result: Dict[str, Any]) -> Dict[str, Any]:
+    if result.get("reconciliation_required") or result.get("trading_halted"):
+        raise HTTPException(status_code=503, detail=result)
+    if result.get("status") == "rejected":
+        raise HTTPException(
+            status_code=403,
+            detail=result.get("error", "Order rejected by pre-trade risk guard."),
+        )
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=502,
+            detail=result.get("error", "Broker did not confirm order submission."),
+        )
+    return result
 
 
 @router.get("/account")
@@ -57,9 +75,26 @@ async def get_positions(
 
 @router.delete("/positions/{symbol}")
 async def close_position(
-    symbol: str, client: AlpacaClient = Depends(get_alpaca)
+    symbol: str,
+    client_order_id: str = Header(
+        min_length=16,
+        max_length=32,
+        pattern=r"^[A-Za-z0-9._-]+$",
+        alias="Idempotency-Key",
+    ),
+    client: AlpacaClient = Depends(get_alpaca),
 ) -> Dict[str, Any]:
-    return await client.close_position(symbol)
+    guard = PreTradeRiskGuard.get_instance()
+    result = await guard.validate_and_close_position(
+        client, symbol, client_order_id
+    )
+    if result.get("reconciliation_required") or result.get("trading_halted"):
+        raise HTTPException(status_code=503, detail=result)
+    if result.get("status") == "rejected":
+        raise HTTPException(status_code=409, detail=result)
+    if not result.get("success"):
+        raise HTTPException(status_code=502, detail=result)
+    return result
 
 
 @router.get("/orders")
@@ -76,11 +111,21 @@ async def list_orders(
 async def get_order_status(
     order_id: str, client: AlpacaClient = Depends(get_alpaca)
 ) -> Dict[str, Any]:
-    orders = await client.get_orders(status="all")
-    for order in orders:
-        if order.get("id") == order_id:
-            return order
-    raise HTTPException(status_code=404, detail="Order not found")
+    try:
+        return await client.get_order(order_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": str(exc),
+                "reconciliation_required": True,
+                "trading_halted": True,
+            },
+        ) from exc
 
 
 @router.post("/order")
@@ -90,10 +135,17 @@ async def submit_order(
     guard = PreTradeRiskGuard.get_instance()
     order_dict = order.model_dump() if hasattr(order, "model_dump") else order.dict()
     result = await guard.validate_and_submit(client, order_dict)
+    if result.get("reconciliation_required") or result.get("trading_halted"):
+        raise HTTPException(status_code=503, detail=result)
     if result.get("status") == "rejected":
         raise HTTPException(
             status_code=403,
             detail=result.get("error", "Order rejected by pre-trade risk guard."),
+        )
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=502,
+            detail=result.get("error", "Broker did not confirm order submission."),
         )
     return result
 
@@ -102,39 +154,55 @@ async def submit_order(
 async def cancel_order(
     order_id: str, client: AlpacaClient = Depends(get_alpaca)
 ) -> Dict[str, Any]:
-    return await client.cancel_order(order_id)
+    result = await client.cancel_order(order_id)
+    if not result.get("success"):
+        if result.get("reconciliation_required") or result.get("trading_halted"):
+            raise HTTPException(status_code=503, detail=result)
+        raise HTTPException(
+            status_code=502,
+            detail=result.get("error", "Broker did not confirm cancellation."),
+        )
+    return result
 
 
 @router.post("/buy")
 async def buy_stock(
-    symbol: str, qty: float, client: AlpacaClient = Depends(get_alpaca)
+    symbol: str = Query(min_length=1, max_length=16),
+    qty: float = Query(gt=0, allow_inf_nan=False),
+    client_order_id: str = Header(
+        min_length=16,
+        max_length=32,
+        pattern=r"^[A-Za-z0-9._-]+$",
+        alias="Idempotency-Key",
+    ),
+    client: AlpacaClient = Depends(get_alpaca)
 ) -> Dict[str, Any]:
     guard = PreTradeRiskGuard.get_instance()
     result = await guard.validate_and_submit(
-        client, {"symbol": symbol, "qty": qty, "side": "buy"}
+        client,
+        {"symbol": symbol, "qty": qty, "side": "buy", "client_order_id": client_order_id},
     )
-    if result.get("status") == "rejected":
-        raise HTTPException(
-            status_code=403,
-            detail=result.get("error", "Order rejected by pre-trade risk guard."),
-        )
-    return result
+    return _order_result_or_raise(result)
 
 
 @router.post("/sell")
 async def sell_stock(
-    symbol: str, qty: float, client: AlpacaClient = Depends(get_alpaca)
+    symbol: str = Query(min_length=1, max_length=16),
+    qty: float = Query(gt=0, allow_inf_nan=False),
+    client_order_id: str = Header(
+        min_length=16,
+        max_length=32,
+        pattern=r"^[A-Za-z0-9._-]+$",
+        alias="Idempotency-Key",
+    ),
+    client: AlpacaClient = Depends(get_alpaca)
 ) -> Dict[str, Any]:
     guard = PreTradeRiskGuard.get_instance()
     result = await guard.validate_and_submit(
-        client, {"symbol": symbol, "qty": qty, "side": "sell"}
+        client,
+        {"symbol": symbol, "qty": qty, "side": "sell", "client_order_id": client_order_id},
     )
-    if result.get("status") == "rejected":
-        raise HTTPException(
-            status_code=403,
-            detail=result.get("error", "Order rejected by pre-trade risk guard."),
-        )
-    return result
+    return _order_result_or_raise(result)
 
 
 @router.get("/bars")
@@ -195,6 +263,22 @@ async def get_clock(
 ) -> Dict[str, Any]:
     clock = await client.get_clock()
     return {"status": "success", "clock": clock}
+
+
+@router.get("/execution-halt")
+async def execution_halt_state() -> Dict[str, Any]:
+    from nexus.execution.halt_state import ExecutionHaltState
+
+    state = ExecutionHaltState.get_state()
+    return {"halted": ExecutionHaltState.is_halted(), "state": state}
+
+
+@router.get("/order-intents/unresolved")
+async def unresolved_order_intents() -> Dict[str, Any]:
+    from nexus.audit.governance import GovernanceEngine
+
+    intents = GovernanceEngine().list_unresolved_order_intents()
+    return {"status": "success", "count": len(intents), "intents": intents}
 
 
 @router.get("/health")

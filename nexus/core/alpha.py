@@ -109,7 +109,7 @@ class WaveletDenoiser:
 
 class AlphaEngine:
     _cache: Dict[str, Dict[str, Any]] = {}
-    _CACHE_TTL = 300
+    _CACHE_TTL = 30
 
     def __init__(self, backend_url: str = Config.BACKEND_URL):
         self.kf = AdaptiveKalmanFilter()
@@ -170,51 +170,79 @@ class AlphaEngine:
             df = df.rename(
                 columns={k: v for k, v in mapping.items() if k in df.columns}
             )
-        else:
+            df.attrs["source"] = "alpaca"
+        elif Config.ALLOW_YAHOO_FALLBACK:
             yf_logger: Optional[logging.Logger] = None
             old_yf_level: Optional[int] = None
             try:
                 import yfinance as yf
 
+                intervals = {"1D": "1d", "15Min": "15m", "1Min": "1m"}
+                interval = intervals.get(timeframe)
+                if interval is None:
+                    logger.warning("Unsupported Yahoo fallback timeframe %s.", timeframe)
+                    return pd.DataFrame()
                 yf_logger = logging.getLogger("yfinance")
                 old_yf_level = yf_logger.level
                 yf_logger.setLevel(logging.CRITICAL)
-                interval = (
-                    "1d"
-                    if timeframe == "1D"
-                    else "15m" if timeframe == "15Min" else "1m"
+                df = yf.download(
+                    symbol, period="7d", interval=interval, progress=False
                 )
-                df = yf.download(symbol, period="7d", interval=interval, progress=False)
-                if getattr(df, "empty", True) and timeframe == "1Min":
-                    df = yf.download(
-                        symbol, period="7d", interval="15m", progress=False
-                    )
-            except Exception as e:
-                logger.debug("yfinance fallback failed for %s: %s", symbol, e)
+                if not getattr(df, "empty", True):
+                    df.attrs["source"] = "yahoo_opt_in"
+            except Exception as exc:
+                logger.warning("Opt-in Yahoo fallback failed for %s: %s", symbol, exc)
                 return pd.DataFrame()
             finally:
                 if yf_logger is not None and old_yf_level is not None:
                     yf_logger.setLevel(old_yf_level)
+        else:
+            logger.warning(
+                "Alpaca data unavailable for %s; alternate data fallback is disabled.",
+                symbol,
+            )
+            return pd.DataFrame()
         if df is None or (hasattr(df, "empty") and df.empty):
             return pd.DataFrame()
         return self._normalize_columns(df, limit)
 
     def _normalize_columns(self, df: pd.DataFrame, limit: int) -> pd.DataFrame:
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = pd.Index([str(c[0]).lower() for c in df.columns])
+        """Normalize OHLCV without fabricating missing prices or volume."""
+        result = df.copy()
+        source_attrs = dict(getattr(df, "attrs", {}))
+        if isinstance(result.columns, pd.MultiIndex):
+            result.columns = pd.Index([str(column[0]).lower() for column in result.columns])
         else:
-            df.columns = pd.Index([str(c).lower() for c in df.columns])
+            result.columns = pd.Index([str(column).lower() for column in result.columns])
+
+        result = result.loc[:, ~result.columns.duplicated()].copy()
         rename_map = {"adj close": "close", "unadjusted close": "close"}
-        for k, v in rename_map.items():
-            if k in df.columns and v not in df.columns:
-                df[v] = df[k]
-        for col in ["open", "high", "low", "close", "volume"]:
-            if col not in df.columns:
-                df[col] = df["close"] if "close" in df.columns else 0.0
-            col_data = df[col]
-            if isinstance(col_data, pd.DataFrame):
-                df[col] = col_data.iloc[:, 0]
-        return df.loc[:, ~df.columns.duplicated()].tail(limit)
+        for old_name, new_name in rename_map.items():
+            if old_name in result.columns and new_name not in result.columns:
+                result = result.rename(columns={old_name: new_name})
+
+        required = ["open", "high", "low", "close", "volume"]
+        missing = [column for column in required if column not in result.columns]
+        if missing:
+            logger.warning("Rejecting malformed market data; missing OHLCV columns: %s", missing)
+            return pd.DataFrame(columns=required)
+
+        for column in required:
+            values = result[column]
+            if isinstance(values, pd.DataFrame):
+                values = values.iloc[:, 0]
+            result[column] = pd.to_numeric(values, errors="coerce")
+
+        numeric = result[required].to_numpy(dtype=float)
+        valid = np.isfinite(numeric).all(axis=1)
+        valid &= (result["open"].to_numpy() > 0)
+        valid &= (result["high"].to_numpy() > 0)
+        valid &= (result["low"].to_numpy() > 0)
+        valid &= (result["close"].to_numpy() > 0)
+        valid &= (result["volume"].to_numpy() >= 0)
+        cleaned = result.loc[valid].tail(limit).copy()
+        cleaned.attrs.update(source_attrs)
+        return cleaned
 
     def generate_signal(
         self,

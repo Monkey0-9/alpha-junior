@@ -1,4 +1,5 @@
 import logging
+import importlib
 import numpy as np
 import pandas as pd
 from typing import Dict, Tuple, Any
@@ -10,10 +11,9 @@ nn: Any = None
 optim: Any = None
 
 try:
-    import torch
-    import torch.nn as nn
-    import torch.optim as optim
-
+    torch = importlib.import_module("torch")
+    nn = importlib.import_module("torch.nn")
+    optim = importlib.import_module("torch.optim")
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
@@ -45,33 +45,45 @@ class GradientBoostedTimeSeriesModel:
             max_iter=100, learning_rate=0.05, max_depth=5, random_state=42
         )
         self.scaler = StandardScaler()
+        self.feature_cols: list[str] = []
         self.is_trained = False
 
     def _prepare_features(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
-        """Extract feature matrix and target vector from DataFrame."""
-        df_copy = df.copy()
+        """Build point-in-time features and next-bar direction labels.
 
-        # Generate target: +1 if next close > current close, else -1
-        if "close" in df_copy.columns:
-            df_copy["target"] = np.where(
-                df_copy["close"].shift(-1) > df_copy["close"], 1, -1
-            )
-        else:
-            df_copy["target"] = 0
-
-        # Ensure all feature columns exist
-        available_cols = [c for c in self.FEATURE_COLS if c in df_copy.columns]
-        if not available_cols:
-            # Fallback to numeric columns
-            numeric_cols = df_copy.select_dtypes(include=[np.number]).columns.tolist()
-            available_cols = [c for c in numeric_cols if c != "target"]
-
-        df_clean = df_copy.dropna(subset=available_cols)
-        if len(df_clean) < 20:
+        The final row is intentionally excluded because its forward return is
+        not yet observable. Feature columns are fixed for the lifetime of a fit.
+        """
+        if "close" not in df.columns:
+            self.feature_cols = []
             return np.array([]), np.array([])
 
-        X = df_clean[available_cols].to_numpy()
-        y = df_clean["target"].to_numpy()
+        available_cols = [column for column in self.FEATURE_COLS if column in df.columns]
+        if not available_cols:
+            self.feature_cols = []
+            return np.array([]), np.array([])
+
+        frame = df.loc[:, available_cols + ["close"]].copy()
+        for column in set(available_cols + ["close"]):
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+
+        future_close = frame["close"].shift(-1)
+        current_close = frame["close"]
+        frame["target"] = np.where(future_close > current_close, 1, -1)
+        frame.loc[future_close.isna(), "target"] = np.nan
+        frame = frame.replace([np.inf, -np.inf], np.nan).dropna(
+            subset=available_cols + ["close", "target"]
+        )
+        if len(frame) < 30:
+            self.feature_cols = []
+            return np.array([]), np.array([])
+
+        self.feature_cols = list(available_cols)
+        X = frame[self.feature_cols].to_numpy(dtype=np.float64)
+        y = frame["target"].to_numpy(dtype=np.int64)
+        if not np.isfinite(X).all():
+            self.feature_cols = []
+            return np.array([]), np.array([])
         return X, y
 
     def fit(self, df: pd.DataFrame) -> bool:
@@ -102,12 +114,9 @@ class GradientBoostedTimeSeriesModel:
           0  (Hold / No Trade)
         """
         if not self.is_trained:
-            # Attempt quick fit if untrained
-            success = self.fit(df)
-            if not success:
-                return 0
+            return 0
 
-        available_cols = [c for c in self.FEATURE_COLS if c in df.columns]
+        available_cols = self.feature_cols
         if not available_cols or len(df) < 1:
             return 0
 
@@ -138,12 +147,12 @@ class GradientBoostedTimeSeriesModel:
 
     def predict_proba(self, df: pd.DataFrame) -> Dict[int, float]:
         """Returns probability dictionary {1: p_buy, -1: p_sell, 0: p_hold}."""
-        default_probs = {1: 0.33, -1: 0.33, 0: 0.34}
-        if not self.is_trained:
-            if not self.fit(df):
-                return default_probs
+        # Untrained means unavailable, not a synthetic one-third probability.
+        default_probs = {1: 0.0, -1: 0.0, 0: 1.0}
+        if not self.is_trained or not self.feature_cols:
+            return default_probs
 
-        available_cols = [c for c in self.FEATURE_COLS if c in df.columns]
+        available_cols = self.feature_cols
         if not available_cols or len(df) < 1:
             return default_probs
 
@@ -196,10 +205,13 @@ class PyTorchLSTMModel:
             return np.array([]), np.array([])
 
         df_copy = df.copy()
-        df_copy["target"] = np.where(
-            df_copy["close"].shift(-1) > df_copy["close"], 1, 0
+        current_close = pd.to_numeric(df_copy["close"], errors="coerce")
+        future_close = current_close.shift(-1)
+        df_copy["target"] = np.where(future_close > current_close, 1, 0)
+        df_copy.loc[future_close.isna(), "target"] = np.nan
+        df_clean = df_copy.replace([np.inf, -np.inf], np.nan).dropna(
+            subset=available_cols + ["close", "target"]
         )
-        df_clean = df_copy.dropna(subset=available_cols + ["target"])
 
         if len(df_clean) < self.sequence_length + 5:
             return np.array([]), np.array([])
@@ -329,10 +341,13 @@ class TemporalTransformerModel:
                 return self.tree_fallback.fit(df)
 
             df_copy = df.copy()
-            df_copy["target"] = np.where(
-                df_copy["close"].shift(-1) > df_copy["close"], 1, 0
+            current_close = pd.to_numeric(df_copy["close"], errors="coerce")
+            future_close = current_close.shift(-1)
+            df_copy["target"] = np.where(future_close > current_close, 1, 0)
+            df_copy.loc[future_close.isna(), "target"] = np.nan
+            df_clean = df_copy.replace([np.inf, -np.inf], np.nan).dropna(
+                subset=available_cols + ["close", "target"]
             )
-            df_clean = df_copy.dropna(subset=available_cols + ["target"])
 
             if len(df_clean) < self.sequence_length + 5:
                 return self.tree_fallback.fit(df)

@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+import uuid
 import httpx
 import numpy as np
 import pandas as pd
@@ -9,6 +10,7 @@ from typing import List, Dict, Any, Optional, cast
 from nexus.audit.governance import GovernanceEngine
 from nexus.core.alpha import AlphaEngine
 from nexus.execution.execution_ai import ExecutionAgent
+from nexus.execution.halt_state import ExecutionHaltState
 from nexus.monitoring.health import HealthMonitor
 from nexus.models.zoo.ensemble import AIEnsembleBrain
 from nexus.risk.engine import RiskEngine
@@ -63,7 +65,10 @@ class NexusEngine:
         # PERF FIX: Persistent client for connection pooling
         self._client: Optional[httpx.AsyncClient] = None
         # Tracking Submitted Orders
-        self._active_orders: Dict[str, str] = {}  # symbol -> order_id
+        self._active_orders: Dict[str, str] = {}  # symbol -> broker order id
+        self._active_client_order_ids: Dict[str, str] = {}
+        self._execution_halted = ExecutionHaltState.is_halted()
+        self._cycle_id = uuid.uuid4().hex
 
         # Superhuman Brain: drawdown velocity tracker
         self._equity_history: List[float] = []  # recent equity snapshots
@@ -176,6 +181,149 @@ class NexusEngine:
             logger.error("Unable to reach execution backend.")
             return False
 
+        # Recover durable app intents and broker order history before the scheduler
+        # can create a new entry. Query all recent orders so a fill/cancel that
+        # completed while the process was down can be matched to its client ID.
+        try:
+            unresolved_intents = self.governance.list_unresolved_order_intents()
+            unresolved_by_client_id = {
+                str(intent["client_order_id"]): intent
+                for intent in unresolved_intents
+                if intent.get("client_order_id")
+            }
+        except Exception as exc:
+            logger.critical("Unable to read durable order-intent ledger: %s", exc)
+            self._trip_execution_halt("Order-intent ledger unavailable on startup.")
+            return False
+
+        try:
+            orders_response = await client.get(
+                f"{self.backend_url}/api/alpaca/orders",
+                params={"status": "all", "limit": 500},
+            )
+            orders_response.raise_for_status()
+            orders_payload = orders_response.json()
+            broker_orders = orders_payload.get("orders")
+            if not isinstance(broker_orders, list):
+                raise RuntimeError("Broker order-history response is malformed.")
+
+            terminal_statuses = {
+                "filled": "FILLED",
+                "canceled": "CANCELLED",
+                "cancelled": "CANCELLED",
+                "expired": "EXPIRED",
+                "rejected": "REJECTED",
+            }
+            matched_intents: set[str] = set()
+
+            for order in broker_orders:
+                if not isinstance(order, dict):
+                    raise RuntimeError("Broker returned malformed order-history record.")
+                order_id = order.get("id") or order.get("order_id")
+                symbol = order.get("symbol")
+                status = str(order.get("status", "")).lower()
+                client_order_id = order.get("client_order_id")
+                intent = (
+                    unresolved_by_client_id.get(str(client_order_id))
+                    if client_order_id
+                    else None
+                )
+
+                if intent and client_order_id:
+                    matched_intents.add(str(client_order_id))
+                    if not order_id or not symbol:
+                        raise RuntimeError("Matched broker order omitted ID or symbol.")
+                    mapped_status = terminal_statuses.get(status)
+                    if mapped_status:
+                        self.governance.update_order_intent(
+                            str(client_order_id),
+                            mapped_status,
+                            broker_order_id=str(order_id),
+                        )
+                        filled_price = order.get("filled_avg_price")
+                        filled_qty = order.get("filled_qty") or order.get("qty") or intent["qty"]
+                        if not self.governance.has_trade_record(str(client_order_id)):
+                            self.governance.record_trade({
+                                "symbol": str(symbol).upper(),
+                                "side": str(order.get("side", intent["side"])).lower(),
+                                "qty": float(filled_qty),
+                                "price": float(filled_price) if filled_price is not None else None,
+                                "order_type": str(order.get("type") or intent["order_type"]),
+                                "strategy": intent.get("strategy"),
+                                "status": mapped_status,
+                                "order_id": str(order_id),
+                                "client_order_id": str(client_order_id),
+                                "intent_id": str(client_order_id),
+                            })
+                        else:
+                            self.governance.update_trade_order_status(
+                                str(client_order_id),
+                                mapped_status,
+                                broker_order_id=str(order_id),
+                                qty=float(filled_qty) if filled_qty is not None else None,
+                                price=float(filled_price) if filled_price is not None else None,
+                            )
+                    else:
+                        self.governance.update_order_intent(
+                            str(client_order_id),
+                            "PARTIALLY_FILLED" if status in {"partially_filled", "partial_fill"} else "SUBMITTED",
+                            broker_order_id=str(order_id),
+                        )
+                        normalized_symbol = str(symbol).upper()
+                        self._active_orders[normalized_symbol] = str(order_id)
+                        self._active_client_order_ids[normalized_symbol] = str(client_order_id)
+                        self._trip_execution_halt(
+                            f"Unresolved broker order recovered on startup (status={status or 'UNKNOWN'}).",
+                            symbol=normalized_symbol,
+                            order_id=str(order_id),
+                        )
+                    continue
+
+                # Even a broker order with an unknown/local-less client ID blocks
+                # trading. It may have been entered manually or by another worker.
+                if status not in terminal_statuses:
+                    if not order_id or not symbol:
+                        raise RuntimeError("Open broker order lacks ID or symbol.")
+                    normalized_symbol = str(symbol).upper()
+                    self._active_orders[normalized_symbol] = str(order_id)
+                    if client_order_id:
+                        self._active_client_order_ids[normalized_symbol] = str(client_order_id)
+                    self._trip_execution_halt(
+                        "Unmatched broker working order found on startup.",
+                        symbol=normalized_symbol,
+                        order_id=str(order_id),
+                    )
+
+            # An APPROVED / UNKNOWN intent with no matching order cannot be
+            # assumed rejected; retain its halt for manual reconciliation.
+            for client_order_id, intent in unresolved_by_client_id.items():
+                if client_order_id not in matched_intents:
+                    self._trip_execution_halt(
+                        "Durable order intent has no matching order in recent broker history; acceptance remains unproven.",
+                        symbol=intent.get("symbol"),
+                        order_id=client_order_id,
+                    )
+
+            # Re-read unresolved state after broker reconciliation. Any remaining
+            # entry blocks scheduling even if the persistent halt file is absent.
+            remaining = self.governance.list_unresolved_order_intents()
+            if remaining:
+                logger.critical(
+                    "%d unresolved order intent(s) remain after startup reconciliation.",
+                    len(remaining),
+                )
+                self._trip_execution_halt("Unresolved order intents remain after startup reconciliation.")
+        except Exception as exc:
+            logger.critical(
+                "Startup broker order reconciliation failed; engine cannot enable entries: %s",
+                exc,
+            )
+            self.health_monitor.record(
+                "broker", False, details="Startup order reconciliation failed"
+            )
+            self.health_monitor.heartbeat()
+            return False
+
         # High-speed Go Audit
         audit = PolyglotBridge.audit_platform_go(self.backend_url)
         logger.info(f"Polyglot Audit Status: {audit.get('overall_health')}")
@@ -229,27 +377,52 @@ class NexusEngine:
         return self.universe_manager.is_valid_symbol(symbol)
 
     async def get_account_state(self) -> Dict[str, Any]:
+        """Return verified broker state; unknown is never replaced by fallback equity."""
         client = await self._get_client()
         try:
             response = await client.get(f"{self.backend_url}/api/alpaca/account")
-            if response.status_code == 200:
-                return cast(Dict[str, Any], response.json())
+            response.raise_for_status()
+            account = cast(Dict[str, Any], response.json())
+            if not isinstance(account, dict) or account.get("enabled") is False:
+                raise RuntimeError("Broker account response is invalid or disabled.")
+            if not account.get("simulated") and account.get("status") != "ACTIVE":
+                raise RuntimeError("Live broker account is not verified ACTIVE.")
+            equity_raw = account.get("equity", account.get("portfolio_value"))
+            last_equity_raw = account.get("last_equity", equity_raw)
+            equity = float(equity_raw)
+            last_equity = float(last_equity_raw)
+            if (
+                not np.isfinite(equity)
+                or equity <= 0
+                or not np.isfinite(last_equity)
+                or last_equity <= 0
+            ):
+                raise RuntimeError("Broker account returned invalid equity.")
+            return account
         except Exception as exc:
-            logger.warning(f"Account fetch failure: {exc}")
-        return {
-            "equity": self.portfolio_value,
-            "last_equity": self.portfolio_value,
-        }
+            logger.error("Account fetch failed; broker state is unknown: %s", exc)
+            raise RuntimeError("Cannot verify broker account state; trading cycle aborted.") from exc
 
     async def get_positions(self) -> List[Dict[str, Any]]:
+        """Return broker-reconciled positions; an HTTP failure is not an empty portfolio."""
         client = await self._get_client()
         try:
             response = await client.get(f"{self.backend_url}/api/alpaca/positions")
-            if response.status_code == 200:
-                return cast(List[Dict[str, Any]], response.json().get("positions", []))
+            response.raise_for_status()
+            payload = cast(Dict[str, Any], response.json())
+            positions = payload.get("positions")
+            if not isinstance(positions, list):
+                raise RuntimeError("Broker positions response is missing a positions list.")
+            for position in positions:
+                if not isinstance(position, dict) or not position.get("symbol"):
+                    raise RuntimeError("Broker returned malformed position data.")
+                quantity = float(position.get("qty", float("nan")))
+                if not np.isfinite(quantity):
+                    raise RuntimeError("Broker returned non-finite position quantity.")
+            return cast(List[Dict[str, Any]], positions)
         except Exception as exc:
-            logger.warning(f"Position fetch failure: {exc}")
-        return []
+            logger.error("Position fetch failed; refusing to assume an empty portfolio: %s", exc)
+            raise RuntimeError("Cannot reconcile broker positions; trading cycle aborted.") from exc
 
     async def fetch_universe_history(
         self, symbols: List[str], timeframe: str = "1D", limit: int = 80
@@ -277,69 +450,176 @@ class NexusEngine:
     def build_portfolio_state(
         self, account: Dict[str, Any], positions: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
-        total_value = float(account.get("equity", self.portfolio_value))
-        last_equity = float(account.get("last_equity", total_value))
-        if np.isnan(total_value) or total_value <= 0:
-            total_value = self.portfolio_value
-        drawdown = max(0.0, (last_equity - total_value) / max(total_value, 1.0))
+        equity_raw = account.get("equity", account.get("portfolio_value"))
+        last_equity_raw = account.get("last_equity", equity_raw)
+        if equity_raw is None or last_equity_raw is None:
+            raise ValueError("Cannot build portfolio state without broker equity.")
+        total_value = float(equity_raw)
+        last_equity = float(last_equity_raw)
+        if (
+            not np.isfinite(total_value)
+            or total_value <= 0
+            or not np.isfinite(last_equity)
+            or last_equity <= 0
+        ):
+            raise ValueError("Cannot build portfolio state from invalid equity.")
+        drawdown = max(0.0, (last_equity - total_value) / last_equity)
         return {
             "total_value": total_value,
             "drawdown": drawdown,
             "positions": positions,
         }
 
+    def _trip_execution_halt(
+        self, reason: str, *, symbol: Optional[str] = None, order_id: Optional[str] = None
+    ) -> None:
+        """Persist a circuit breaker after an order lifecycle becomes ambiguous."""
+        self._execution_halted = True
+        try:
+            ExecutionHaltState.trip(reason, symbol=symbol, order_id=order_id)
+        except Exception as exc:
+            logger.critical("Unable to persist execution halt; process must remain stopped: %s", exc)
+        self.health_monitor.record(
+            "execution", False, details=f"TRADING HALTED: {reason}"
+        )
+        self.health_monitor.heartbeat()
+
     async def _verify_order_fills(self) -> None:
-        """Check status of active orders and clear them once filled/cancelled."""
+        """Reconcile all tracked orders and update their durable intent records."""
         if not self._active_orders:
             return
 
         client = await self._get_client()
-        to_remove = []
+        terminal_statuses = {
+            "filled": "FILLED",
+            "canceled": "CANCELLED",
+            "cancelled": "CANCELLED",
+            "expired": "EXPIRED",
+            "rejected": "REJECTED",
+        }
         for symbol, order_id in list(self._active_orders.items()):
             try:
                 response = await client.get(
                     f"{self.backend_url}/api/alpaca/orders/{order_id}"
                 )
-                if response.status_code == 200:
-                    order_info = response.json()
-                    status = order_info.get("status") or order_info.get("order_status")
-                    if status in {"filled", "canceled", "expired", "rejected"}:
-                        logger.info(
-                            f"Order {order_id} for {symbol} finalized: {status}"
+                if response.status_code != 200:
+                    self._trip_execution_halt(
+                        f"Unable to reconcile broker order (HTTP {response.status_code}).",
+                        symbol=symbol,
+                        order_id=order_id,
+                    )
+                    continue
+
+                order_info = response.json()
+                status = str(
+                    order_info.get("status") or order_info.get("order_status") or ""
+                ).lower()
+                client_order_id = (
+                    order_info.get("client_order_id")
+                    or self._active_client_order_ids.get(symbol)
+                )
+                if client_order_id:
+                    try:
+                        if status in terminal_statuses:
+                            terminal_state = terminal_statuses[status]
+                            self.governance.update_order_intent(
+                                client_order_id,
+                                terminal_state,
+                                broker_order_id=order_id,
+                            )
+                            if self.governance.has_trade_record(client_order_id):
+                                filled_qty = order_info.get("filled_qty")
+                                filled_price = order_info.get("filled_avg_price")
+                                self.governance.update_trade_order_status(
+                                    client_order_id,
+                                    terminal_state,
+                                    broker_order_id=order_id,
+                                    qty=float(filled_qty) if filled_qty is not None else None,
+                                    price=float(filled_price) if filled_price is not None else None,
+                                )
+                        elif status in {"partially_filled", "partial_fill"}:
+                            self.governance.update_order_intent(
+                                client_order_id,
+                                "PARTIALLY_FILLED",
+                                broker_order_id=order_id,
+                            )
+                            if self.governance.has_trade_record(client_order_id):
+                                filled_qty = order_info.get("filled_qty")
+                                filled_price = order_info.get("filled_avg_price")
+                                self.governance.update_trade_order_status(
+                                    client_order_id,
+                                    "PARTIALLY_FILLED",
+                                    broker_order_id=order_id,
+                                    qty=float(filled_qty) if filled_qty is not None else None,
+                                    price=float(filled_price) if filled_price is not None else None,
+                                )
+                    except Exception as exc:
+                        self._trip_execution_halt(
+                            f"Could not durably update order intent after broker status {status}: {exc}",
+                            symbol=symbol,
+                            order_id=order_id,
                         )
-                        to_remove.append(symbol)
-                elif response.status_code == 404:
-                    logger.warning(f"Order {order_id} not found on backend.")
-                    to_remove.append(symbol)
+                        continue
+
+                if status in terminal_statuses:
+                    logger.info("Order %s for %s finalized: %s", order_id, symbol, status)
+                    self._active_orders.pop(symbol, None)
+                    self._active_client_order_ids.pop(symbol, None)
                 else:
-                    logger.debug(
-                        f"Order {order_id} for {symbol} status check returned {response.status_code}."
+                    logger.warning(
+                        "Order %s for %s remains unresolved (status=%s). New entries are blocked.",
+                        order_id,
+                        symbol,
+                        status or "UNKNOWN",
                     )
             except Exception as exc:
-                logger.debug(f"Error verifying order {order_id}: {exc}")
-
-        for s in to_remove:
-            self._active_orders.pop(s, None)
+                logger.error("Order reconciliation failed for %s (%s): %s", symbol, order_id, exc)
+                self._trip_execution_halt(
+                    "Broker order lifecycle reconciliation failed.",
+                    symbol=symbol,
+                    order_id=order_id,
+                )
 
     async def run_cycle(self) -> None:
         logger.info("Starting new trading cycle.")
+        self._cycle_id = uuid.uuid4().hex
         if time.time() - self.last_universe_refresh > Config.UNIVERSE_RESCAN_INTERVAL:
             await self.refresh_universe()
 
-        # Phase 1: Verify fills from previous cycle
+        # Phase 1: Verify fills from previous cycle.
         await self._verify_order_fills()
+        if self._execution_halted or ExecutionHaltState.is_halted():
+            logger.critical(
+                "Execution circuit breaker is active; cycle is read/reconciliation-only."
+            )
+            self.health_monitor.record(
+                "execution", False, details="Persistent execution halt active"
+            )
+            self.health_monitor.heartbeat()
+            return
 
         client = await self._get_client()
+        clock_verified = False
+        clock_data: Dict[str, Any] = {"is_open": False}
         try:
             response = await client.get(f"{self.backend_url}/api/alpaca/clock")
-            clock_data = (
-                response.json() if response.status_code == 200 else {"is_open": False}
-            )
-        except Exception:
-            clock_data = {"is_open": False}
+            response.raise_for_status()
+            clock_payload = response.json()
+            clock_data = clock_payload.get("clock", clock_payload)
+            if not isinstance(clock_data, dict) or not isinstance(clock_data.get("is_open"), bool):
+                raise RuntimeError("Broker clock response is malformed.")
+            clock_verified = True
+        except Exception as exc:
+            logger.error("Broker market clock is unavailable; new entries will be blocked: %s", exc)
 
-        account = await self.get_account_state()
-        current_positions = await self.get_positions()
+        try:
+            account = await self.get_account_state()
+            current_positions = await self.get_positions()
+        except Exception as exc:
+            logger.critical("Trading cycle aborted because broker account/positions are unknown: %s", exc)
+            self.health_monitor.record("broker", False, details="Account/position state unknown")
+            self.health_monitor.heartbeat()
+            return
         holdings = {p["symbol"]: p for p in current_positions}
 
         for symbol in list(self.position_ages):
@@ -379,31 +659,50 @@ class NexusEngine:
 
         await self.manage_positions(current_positions, history)
 
+        # Keep the engine conservative while any prior broker order is still
+        # open or cannot be reconciled. Pending quantity is not in holdings yet.
+        if self._active_orders:
+            logger.warning(
+                "New entries blocked while %d broker order(s) remain unresolved.",
+                len(self._active_orders),
+            )
+            return
+
+        if not clock_verified:
+            logger.error("New entries blocked because market-hours state is unknown.")
+            return
+
         benchmark_data = await self.alpha_engine.fetch_market_data(
             "SPY", timeframe="1D", limit=120
         )
 
-        if not benchmark_data.empty:
-            try:
-                self.market_regime = self.regime_detector.detect(benchmark_data)
-                regime_probs = self.regime_detector.get_regime_probabilities()
-            except Exception as e:
-                logger.warning(f"Regime detection failed: {e}")
-                self.market_regime = "SIDEWAYS"
-                regime_probs = {
-                    "BULL": 0.25,
-                    "BEAR": 0.25,
-                    "SIDEWAYS": 0.25,
-                    "TURBULENT": 0.25,
-                }
-        else:
-            self.market_regime = "SIDEWAYS"
-            regime_probs = {
-                "BULL": 0.25,
-                "BEAR": 0.25,
-                "SIDEWAYS": 0.25,
-                "TURBULENT": 0.25,
-            }
+        if benchmark_data.empty or "close" not in benchmark_data.columns:
+            logger.error("SPY benchmark data is unavailable; no new risk-increasing orders.")
+            self.health_monitor.record("market", False, details="Benchmark data unavailable")
+            self.health_monitor.heartbeat()
+            return
+
+        benchmark_close = pd.to_numeric(benchmark_data["close"], errors="coerce")
+        benchmark_returns = benchmark_close.pct_change(fill_method=None)
+        benchmark_returns = benchmark_returns.replace([np.inf, -np.inf], np.nan).dropna()
+        returns_list = benchmark_returns.to_numpy(dtype=float)
+        if returns_list.size < 20 or not np.isfinite(returns_list).all():
+            logger.error(
+                "SPY risk sample is insufficient or invalid (%d returns); new orders blocked.",
+                returns_list.size,
+            )
+            self.health_monitor.record("risk", False, details="Invalid benchmark return sample")
+            self.health_monitor.heartbeat()
+            return
+
+        try:
+            self.market_regime = self.regime_detector.detect(benchmark_data)
+            regime_probs = self.regime_detector.get_regime_probabilities()
+        except Exception as exc:
+            logger.error("Regime detection failed; new entries blocked: %s", exc)
+            self.health_monitor.record("risk", False, details="Regime detection failed")
+            self.health_monitor.heartbeat()
+            return
 
         # ── AI Ensemble Brain Conviction Layer ───────────────────────────────
         enhanced_signals: Dict[str, float] = {}
@@ -440,21 +739,24 @@ class NexusEngine:
             historical_data=history,
         )
 
-        returns_list = (
-            benchmark_data["close"].pct_change().dropna().to_numpy()
-            if not benchmark_data.empty
-            else np.array([])
-        )
-        risk_metrics = {
-            "var": 0.0,
-            "cvar": 0.0,
-            "volatility": 0.0,
-            "sharpe": 0.0,
-        }
-        if returns_list.size > 0:
-            rust_risk = PolyglotBridge.calculate_risk_rust(returns_list.tolist())
-            risk_metrics = self.risk_engine.assess_risk(returns_list)
-            risk_metrics["rust_var"] = float(rust_risk.get("var", 0.0))
+        risk_metrics = self.risk_engine.assess_risk(returns_list)
+        rust_risk = PolyglotBridge.calculate_risk_rust(returns_list.tolist())
+        if rust_risk.get("status") == "OK":
+            rust_var = rust_risk.get("var")
+            rust_es = rust_risk.get("expected_shortfall")
+            if (
+                isinstance(rust_var, (int, float))
+                and isinstance(rust_es, (int, float))
+                and np.isfinite(rust_var)
+                and np.isfinite(rust_es)
+            ):
+                risk_metrics["rust_var"] = float(rust_var)
+                risk_metrics["rust_expected_shortfall"] = float(rust_es)
+        else:
+            logger.warning(
+                "Rust risk metrics unavailable (%s); Python risk engine remains authoritative.",
+                rust_risk.get("status", "UNKNOWN"),
+            )
 
         multiplier = self.determine_risk_scale(
             {"regime_probabilities": regime_probs}, risk_metrics
@@ -561,51 +863,58 @@ class NexusEngine:
         selected_strategy: str,
         is_open: bool,
     ) -> None:
-        if abs(weight) < 0.0001 or symbol not in history or history[symbol].empty:
+        """Generate a target delta; the API's PreTradeRiskGuard is the only order authority."""
+        if (
+            ExecutionHaltState.is_halted()
+            or symbol in self._active_orders
+            or abs(weight) < 0.0001
+            or symbol not in history
+            or history[symbol].empty
+        ):
             return
-        current_price = float(history[symbol]["close"].iloc[-1])
 
-        total_value = portfolio_state.get("total_value", self.portfolio_value)
-        target_qty = int((total_value * abs(weight)) / max(current_price, 1.0))
+        try:
+            current_price = float(history[symbol]["close"].iloc[-1])
+            total_value = float(portfolio_state["total_value"])
+            if (
+                not np.isfinite(current_price)
+                or current_price <= 0
+                or not np.isfinite(total_value)
+                or total_value <= 0
+            ):
+                raise ValueError("Target sizing inputs are invalid.")
+        except Exception as exc:
+            logger.error("Unable to size target for %s: %s", symbol, exc)
+            return
+
+        target_qty = int((total_value * abs(weight)) / current_price)
         qty_diff = target_qty - abs(current_qty)
-
-        if abs(qty_diff) < 1 or (abs(qty_diff) * current_price < 100):
+        if abs(qty_diff) < 1 or abs(qty_diff) * current_price < Config.MIN_ORDER_USD:
             return
 
         side = "buy" if qty_diff > 0 else "sell"
         qty = abs(qty_diff)
-        order_type, limit_price = ("market", None)
-
+        order_type = "market"
+        limit_price = None
         if not is_open:
-            order_type, limit_price = (
-                "limit",
-                current_price * (1.002 if side == "buy" else 0.998),
-            )
+            # Limit price is an execution constraint only; the pre-trade guard
+            # independently obtains a verified live mark for risk valuation.
+            order_type = "limit"
+            limit_price = current_price * (1.002 if side == "buy" else 0.998)
 
-        trade_request = {
-            "symbol": symbol,
-            "qty": qty,
-            "side": side,
-            "price": current_price,
-            "order_type": order_type,
-            "strategy": selected_strategy,
-        }
-        if not PolyglotBridge.validate_order_zig(trade_request).get("valid"):
-            return
-        approved, _ = self.governance.check_compliance(
-            trade_request, portfolio_state, current_qty=current_qty
-        )
-        if not approved:
-            return
-
-        payload = {
+        client_order_id = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"alpha-junior:{self._cycle_id}:{symbol}:{side}:{qty}:{selected_strategy}",
+        ).hex[:32]
+        payload: Dict[str, Any] = {
             "symbol": symbol,
             "qty": qty,
             "side": side,
             "order_type": order_type,
             "strategy": selected_strategy,
+            "client_order_id": client_order_id,
         }
-        if limit_price:
+        if limit_price is not None:
             payload["limit_price"] = round(limit_price, 4)
         if not is_open:
             payload["extended_hours"] = True
@@ -613,43 +922,118 @@ class NexusEngine:
         client = await self._get_client()
         try:
             response = await client.post(
-                f"{self.backend_url}/api/alpaca/order", json=payload
+                f"{self.backend_url}/api/alpaca/order",
+                json=payload,
             )
+            response_payload: Dict[str, Any] = {}
+            try:
+                parsed = response.json()
+                if isinstance(parsed, dict):
+                    response_payload = parsed
+            except Exception:
+                pass
+
             if response.status_code in {200, 201}:
-                order_data = response.json()
-                order_id = order_data.get("id") or order_data.get("order_id")
-                if order_id:
-                    self._active_orders[symbol] = order_id
-                    logger.info(f"Order submitted for {symbol}: {order_id}")
-                    self.governance.record_trade(
-                        {
-                            "symbol": symbol,
-                            "side": side,
-                            "qty": qty,
-                            "price": current_price,
-                            "order_type": order_type,
-                            "strategy": selected_strategy,
-                            "status": order_data.get("status", "PENDING"),
-                        }
+                order_id = response_payload.get("id") or response_payload.get("order_id")
+                status = str(response_payload.get("status", "")).lower()
+                if not order_id:
+                    self._trip_execution_halt(
+                        "Order endpoint returned success without a broker order identifier.",
+                        symbol=symbol,
                     )
-                else:
-                    logger.warning(
-                        f"Order response missing id for {symbol}: {order_data}"
-                    )
+                    return
+                self._active_orders[symbol] = str(order_id)
+                self._active_client_order_ids[symbol] = str(
+                    response_payload.get("client_order_id") or client_order_id
+                )
+                logger.info(
+                    "Order submitted for %s: id=%s status=%s",
+                    symbol,
+                    order_id,
+                    status or "unknown",
+                )
+                return
+
+            detail = response_payload.get("detail", response_payload)
+            if isinstance(detail, dict) and (
+                detail.get("reconciliation_required") or detail.get("trading_halted")
+            ):
+                self._trip_execution_halt(
+                    "Order API reported an ambiguous broker outcome.",
+                    symbol=symbol,
+                    order_id=detail.get("order_id"),
+                )
+            elif response.status_code >= 500:
+                self._trip_execution_halt(
+                    f"Order API failed with HTTP {response.status_code}; broker outcome is not certified.",
+                    symbol=symbol,
+                )
             else:
                 logger.error(
-                    f"Order submission failed for {symbol}: HTTP {response.status_code} {response.text}"
+                    "Order submission rejected for %s: HTTP %s %s",
+                    symbol,
+                    response.status_code,
+                    detail,
                 )
         except Exception as exc:
-            logger.error(f"Order submission error for {symbol}: {exc}")
+            self._trip_execution_halt(
+                f"Order request transport outcome is unknown: {exc}",
+                symbol=symbol,
+            )
 
     async def _close_position(self, symbol: str) -> None:
+        """Use the guarded idempotent API close route and track its broker order."""
         client = await self._get_client()
+        client_order_id = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"alpha-junior:{self._cycle_id}:{symbol}:close",
+        ).hex[:32]
         try:
-            await client.delete(f"{self.backend_url}/api/alpaca/positions/{symbol}")
-            self.position_manager.reset_watermark(symbol)
+            response = await client.delete(
+                f"{self.backend_url}/api/alpaca/positions/{symbol}",
+                headers={"Idempotency-Key": client_order_id},
+            )
+            payload: Dict[str, Any] = {}
+            try:
+                parsed = response.json()
+                if isinstance(parsed, dict):
+                    payload = parsed
+            except Exception:
+                pass
+            if response.status_code == 200:
+                broker_order_id = payload.get("order_id") or payload.get("id")
+                if not broker_order_id:
+                    self._trip_execution_halt(
+                        "Close API returned success without broker order ID.",
+                        symbol=symbol,
+                    )
+                    return
+                self._active_orders[symbol] = str(broker_order_id)
+                self._active_client_order_ids[symbol] = client_order_id
+                self.position_manager.reset_watermark(symbol)
+                return
+            detail = payload.get("detail", payload)
+            if isinstance(detail, dict) and (
+                detail.get("reconciliation_required") or detail.get("trading_halted")
+            ):
+                self._trip_execution_halt(
+                    "Close-position API returned an ambiguous outcome.",
+                    symbol=symbol,
+                    order_id=client_order_id,
+                )
+            else:
+                logger.error(
+                    "Position close rejected for %s: HTTP %s %s",
+                    symbol,
+                    response.status_code,
+                    detail,
+                )
         except Exception as exc:
-            logger.error(f"Error closing position for {symbol}: {exc}")
+            self._trip_execution_halt(
+                f"Position close transport outcome is unknown: {exc}",
+                symbol=symbol,
+                order_id=client_order_id,
+            )
 
     async def manage_positions(
         self,
@@ -683,10 +1067,7 @@ class NexusEngine:
                 )
 
                 if should_close:
-                    await client.delete(
-                        f"{self.backend_url}/api/alpaca/positions/{symbol}"
-                    )
-                    self.position_manager.reset_watermark(symbol)
+                    await self._close_position(symbol)
             except Exception as exc:
                 logger.warning(f"Failed to evaluate close for {symbol}: {exc}")
 

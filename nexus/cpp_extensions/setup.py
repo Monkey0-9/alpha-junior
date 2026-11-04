@@ -1,8 +1,37 @@
+import os
+import sys
+
 from setuptools import setup, Extension
+from setuptools.command.build_ext import build_ext as _build_ext
 import pybind11
 
-# Add standard library paths for C++ features on Windows MinGW/MSVC
-common_args = ["-O3", "-std=c++11", "-ffast-math"]
+# Preserve IEEE NaN/Inf semantics: -ffast-math can invalidate risk guards.
+use_mingw = (
+    sys.platform == "win32"
+    and os.getenv("NEXUS_USE_MINGW", "0").strip().lower() in {"1", "true", "yes"}
+)
+if sys.platform == "win32" and not use_mingw:
+    common_args = ["/O2", "/std:c++14"]
+    link_args = []
+elif use_mingw:
+    common_args = ["-O3", "-std=c++11"]
+    link_args = ["-static-libgcc", "-static-libstdc++"]
+else:
+    common_args = ["-O3", "-std=c++11"]
+    link_args = []
+
+
+class PlatformBuildExt(_build_ext):
+    """Avoid forwarding Windows module-definition files to Unix linkers."""
+
+    def get_export_symbols(self, ext):
+        symbols = super().get_export_symbols(ext)
+        if sys.platform != "win32":
+            symbols = [symbol for symbol in symbols if not symbol.lower().endswith(".def")]
+        return symbols
+
+
+build_options = {"build_ext": {"compiler": "mingw32"}} if use_mingw else {}
 
 ext_modules = [
     Extension(
@@ -23,7 +52,7 @@ ext_modules = [
         include_dirs=[pybind11.get_include()],
         language="c++",
         extra_compile_args=common_args,
-        extra_link_args=["-static-libgcc", "-static-libstdc++"],
+        extra_link_args=link_args,
     ),
     Extension(
         "nexus_onnx",
@@ -31,7 +60,7 @@ ext_modules = [
         include_dirs=[pybind11.get_include()],
         language="c++",
         extra_compile_args=common_args,
-        extra_link_args=["-static-libgcc", "-static-libstdc++"],
+        extra_link_args=link_args,
     ),
     Extension(
         "nexus_backtester",
@@ -39,7 +68,7 @@ ext_modules = [
         include_dirs=[pybind11.get_include()],
         language="c++",
         extra_compile_args=common_args,
-        extra_link_args=["-static-libgcc", "-static-libstdc++"],
+        extra_link_args=link_args,
     ),
     Extension(
         "nexus_feed",
@@ -47,7 +76,7 @@ ext_modules = [
         include_dirs=[pybind11.get_include()],
         language="c++",
         extra_compile_args=common_args,
-        extra_link_args=["-static-libgcc", "-static-libstdc++"],
+        extra_link_args=link_args,
     ),
 ]
 
@@ -56,4 +85,6 @@ setup(
     version="0.2.0",
     description="Nexus High-Performance C++ Trading Engine",
     ext_modules=ext_modules,
+    options=build_options,
+    cmdclass={"build_ext": PlatformBuildExt},
 )
