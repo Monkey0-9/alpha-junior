@@ -304,21 +304,24 @@ class GovernanceEngine:
         return self.get_order_intent(row[0]) if row else None
 
     def prepare_order_intent(self, request: Dict[str, Any]) -> Dict[str, Any]:
-        """Persist APPROVED before dispatch; duplicate keys never create new orders."""
+        """Atomically reserve an intent before dispatch; concurrent duplicate keys cannot both submit."""
         client_order_id = request.get("client_order_id")
         if not isinstance(client_order_id, str) or not client_order_id:
             raise ValueError("client_order_id is required for an order intent.")
         fingerprint = self._intent_fingerprint(request)
-        existing = self.get_order_intent(client_order_id)
-        if existing:
-            if existing["intent_fingerprint"] != fingerprint:
-                raise RuntimeError(
-                    "Idempotency key was already used for a different order intent."
-                )
-            return existing
-
-        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         try:
+            self._db.execute("BEGIN IMMEDIATE")
+            existing = self.get_order_intent(client_order_id)
+            if existing:
+                if existing["intent_fingerprint"] != fingerprint:
+                    raise RuntimeError(
+                        "Idempotency key was already used for a different order intent."
+                    )
+                self._db.commit()
+                existing["_created"] = False
+                return existing
+
+            now = datetime.datetime.now(datetime.timezone.utc).isoformat()
             self._db.execute(
                 "INSERT INTO order_intents "
                 "(client_order_id, intent_fingerprint, symbol, side, qty, order_type, "
@@ -338,17 +341,25 @@ class GovernanceEngine:
                 ),
             )
             self._db.commit()
-        except sqlite3.Error as exc:
+        except Exception:
             try:
                 self._db.rollback()
             except sqlite3.Error:
                 pass
-            logger.critical("Order intent persistence failed; refusing broker dispatch: %s", exc)
-            raise RuntimeError("Unable to durably persist order intent.") from exc
+            raise
+
         result = self.get_order_intent(client_order_id)
         if result is None:
             raise RuntimeError("Persisted order intent could not be reloaded.")
+        result["_created"] = True
         return result
+
+    def has_trade_record(self, client_order_id: str) -> bool:
+        row = self._db.execute(
+            "SELECT 1 FROM trade_history WHERE client_order_id = ? LIMIT 1",
+            (client_order_id,),
+        ).fetchone()
+        return row is not None
 
     def update_order_intent(
         self,
