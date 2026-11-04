@@ -127,11 +127,12 @@ def test_ts_model_fit_and_predict():
     assert pred in [-1, 0, 1]
 
 
-def test_ts_model_predict_untrained():
+def test_ts_model_predict_untrained_does_not_fit_inference_frame():
     model = GradientBoostedTimeSeriesModel()
     df = _create_ts_data(50)
-    model.predict(df)
-    assert model.is_trained
+    assert model.predict(df) == 0
+    assert model.is_trained is False
+    assert model.predict_proba(df) == {1: 0.0, -1: 0.0, 0: 1.0}
 
 
 def test_ts_model_missing_features():
