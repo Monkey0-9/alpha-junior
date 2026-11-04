@@ -1,113 +1,115 @@
-# Nexus Hardened Institutional Quantitative Platform (v2.0)
+# Alpha-Junior — Quantitative Research and Execution Platform
 
-Nexus is a production-grade, 24/7 autonomous trading intelligence platform. Version 2.0 introduces industrial-grade security, persistent audit trails, and deterministic quantitative modeling.
+> **Release status: NOT PRODUCTION CERTIFIED.** This repository is an evolving quantitative research and broker-integration project. It is not certified for unattended live trading, multi-user service, or worldwide deployment. Do not enable live automated execution solely because CI passes or a backtest looks attractive.
 
-## 🏛 Architecture
+Alpha-Junior (Nexus) combines market-data ingestion, research signals, model experimentation, portfolio construction, broker integration, risk controls, and an operator-facing dashboard. The release audit and launch gates are documented below.
 
-Nexus utilizes a high-performance polyglot architecture (Python, Rust, Go, Zig) with a hardened FastAPI backend and a glassmorphic Streamlit matrix.
+## Current engineering status
 
-```mermaid
-graph TD
-    UI[Nexus Matrix - Streamlit] -- X-API-Key --> API[Nexus API - FastAPI]
-    API -- REST/WebSocket --> EXEC[Alpaca Execution]
-    ENG[Nexus Core Engine] -- X-API-Key --> API
-    ENG --> DB[(SQLite Audit Log)]
-    ENG --> BRIDGE[Polyglot Bridge]
-    
-    subgraph "Satellite Engines"
-    BRIDGE --> RUST[Risk Engine - Rust]
-    BRIDGE --> GO[Audit Sentinel - Go]
-    BRIDGE --> ZIG[Order Validator - Zig]
-    end
+- **Broker integration:** Alpaca client and API routes exist. Live broker lifecycle, partial fills, timeouts, restarts, and reconciliation require sandbox integration and fault-injection sign-off.
+- **Execution safety:** a mandatory pre-trade boundary and persistent execution-halt mechanism are under development. The halt must be manually cleared only after external broker reconciliation.
+- **Research models:** technical/factor signals and tree/neural model wrappers exist. Untrained inference returns HOLD; automatic retraining and promotion are disabled by default.
+- **NCM:** a declared-graph Neural Causal Model research prototype exists under `nexus/research/ncm/`. It is offline/advisory-only and is not connected to executable trades.
+- **Native components:** C++ extensions are built by CI on Linux, Windows and macOS. Rust/Go/Zig components still require separate build, parity and operational validation for each supported target.
+- **Security:** non-liveness API routes require a strong `NEXUS_API_KEY`. Network exposure, TLS, secrets management, rate limits, roles, tenant isolation and deployment hardening are separate release requirements.
+
+## Architecture overview
+
+```text
+Dashboard / CLI
+      |
+      v
+Authenticated FastAPI
+      |
+      +--> Broker client ----> Broker account / orders / positions
+      |          |
+      |          +--> Market data and clock
+      |
+      +--> Mandatory pre-trade guard
+      |          |
+      |          +--> Account/position/mark freshness
+      |          +--> Portfolio governance and durable audit
+      |          +--> Persistent execution circuit breaker
+      |
+      +--> Monitoring and read-only research endpoints
+
+Research pipeline
+      |
+      +--> Point-in-time market data
+      +--> Alpha / factor features
+      +--> GBM / LSTM / Transformer experiments
+      +--> NCM research-only experiments
+      +--> Walk-forward / holdout / cost-aware evaluation
+      +--> Candidate artifact and review workflow
 ```
 
-## 🛡️ Hardening Features (v2.0)
+## Getting started
 
-- **API Security**: Authentication middleware on all mutation endpoints using `X-API-Key`.
-- **CORS Lock**: Restricted browser access to the Streamlit origin only.
-- **Persistence**: All governance audits and trade history are persisted to `data/nexus_audit.db`.
-- **Deterministic AI**: Removed random confidence stubs; replaced with Ensemble Strategy Agreement.
-- **Real Monte Carlo**: Active path simulation for survival analysis and ruin probability.
-- **Cross-Platform**: Full support for Windows, Linux, and macOS (Polyglot portability fixed).
-
-## 🚀 Deployment
-
-### Prerequisites
-
-- Python 3.11+
-- Alpaca API Credentials
-- Docker & Docker Compose (Optional, for containerized run)
-
-### Standard Setup
+Python 3.11 is the current CI target. The portable CI dependency set is provided for tests and static checks; it is **not** a complete, certified production dependency lock.
 
 ```bash
-# 1. Install dependencies
-pip install -r requirements.lock.txt
-# or use requirements.txt for a looser install constraint
-# pip install -r requirements.txt
+git clone https://github.com/Monkey0-9/alpha-junior.git
+cd alpha-junior
 
-# 2. Configure credentials
+python -m venv .venv
+# Activate the virtual environment for your OS.
+python -m pip install --upgrade pip
+python -m pip install -r requirements-ci.txt
+
+# Build the native C++ extensions.
+cd nexus/cpp_extensions
+python setup.py build_ext --inplace
+cd ../..
+
+# Create local configuration from the example.
 cp .env.example .env
-# Set ALPACA_API_KEY, ALPACA_API_SECRET, and NEXUS_API_KEY
+```
 
-# 3. Verify Hardening
+Do not put real credentials in Git. Use a secrets manager or protected environment variables for deployed systems. The example configuration intentionally uses placeholders and disables alternate market-data fallback, automatic retraining and automatic model promotion.
+
+## Configuration
+
+Important controls include:
+
+- `ALPACA_API_KEY` and `ALPACA_API_SECRET`: broker credentials.
+- `ALPACA_PAPER_TRADING=true`: use broker paper trading while validating the integration.
+- `NEXUS_API_KEY`: a randomly generated secret of at least 32 characters.
+- `NEXUS_ALLOW_SIMULATION_FALLBACK=false`: simulation is never an implicit fallback.
+- `NEXUS_ALLOW_YAHOO_FALLBACK=false`: alternate feed use must be explicit and tagged.
+- `NEXUS_MAX_MARKET_DATA_AGE_SECONDS=180`: maximum age for the live pre-trade market mark.
+- `NEXUS_AUTO_RETRAIN_ENABLED=false` and `NEXUS_AUTO_MODEL_PROMOTION=false`: retraining/promotion are disabled until the artifact and review gates are satisfied.
+
+## Run checks
+
+```bash
+ruff check nexus
+mypy nexus
+pytest -q
 python verify_production_ready.py
 ```
 
-### Docker Deployment
+The GitHub Actions workflow builds native C++ extensions and runs lint, typing and tests on Linux, Windows and macOS. A green CI matrix is necessary but **does not certify broker, market-data, quant, security, legal or operational readiness**.
+
+## Research and operating documents
+
+- [Release audit and P0/P1 readiness gates](docs/ALPHA_JUNIOR_RELEASE_AUDIT_2026-11-05.md)
+- [NCM research and promotion protocol](docs/NCM_RESEARCH_PLAN.md)
+- [Automated execution lifecycle and controls](docs/EXECUTION_AUTOMATION_SPEC.md)
+- [Global and multi-user launch checklist](docs/GLOBAL_LAUNCH_CHECKLIST.md)
+
+## Persistent execution halt
+
+Ambiguous order submit/cancel/close outcomes must stop risk-increasing execution. The persistent state is stored under `data/execution_halt.json`; inspect broker open orders, fills and positions independently before clearing it.
 
 ```bash
-docker-compose up --build -d
+python scripts/clear_execution_halt.py \
+  --operator "operator-id" \
+  --reconciliation-reference "broker-export-or-incident-reference" \
+  --confirm-broker-reconciled
 ```
 
-## 📊 Dashboard
+This command records an operator assertion and reference; it does not itself contact a broker or prove reconciliation. Keep the execution service stopped while reconciling.
 
-The Streamlit matrix provides real-time visibility into:
+## License and deployment notice
 
-- **Market Intelligence**: Regime detection, Ensemble agreement, and Quantitative sentiment.
-- **Institutional Holdings**: Live P&L tracking from Alpaca.
-- **Audit Log**: Real-time compliance monitoring from the GovernanceEngine.
-
-## 💾 Data Lake Quick Start
-
-The new Data Engine (Phase 1) provides a complete pipeline to ingest, validate, and query market data:
-
-```python
-from nexus.data.ingestion.yahoo import YahooFinanceSource
-from nexus.data.storage.parquet_writer import ParquetWriter
-from nexus.data.storage.duckdb_helper import DuckDBHelper
-from nexus.data.validation.pipeline import ValidationPipeline
-from datetime import datetime
-
-# 1. Ingest Data
-source = YahooFinanceSource()
-df = source.fetch_historical_ohlcv(["AAPL"], datetime(2023,1,1), datetime(2023,2,1))
-
-# 2. Validate Quality
-pipeline = ValidationPipeline()
-passed, clean_df = pipeline.validate_batch(df)
-
-# 3. Store as partitioned Parquet
-writer = ParquetWriter()
-writer.write_ohlcv(clean_df, source="yahoo")
-
-# 4. Query via DuckDB
-db = DuckDBHelper()
-result = db.query("SELECT symbol, count(*) FROM market_data GROUP BY symbol").df()
-print(result)
-```
-
-## 🛡 Verification & Quality
-
-```bash
-# Run the 27-point comprehensive audit
-python verify_production_ready.py
-
-# Run the test suite
-pytest tests/
-```
-
----
-> Performance claims should be validated with audited historical and live track records. This platform targets superior risk-adjusted returns but does not promise any specific annualized performance.
-
-**Status:** `PRODUCTION_PREPARED` | **Version:** `2.0.0` | **Security:** `HARDENED`
+Before multi-user or cross-border deployment, verify the repository license, broker terms, market-data entitlements, local permissions, exchange rules, privacy obligations, record-retention duties and tax/account requirements for each jurisdiction. No worldwide trading authorization or regulatory approval is implied.
