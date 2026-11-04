@@ -117,9 +117,10 @@ class AIEnsembleBrain:
           - confidence: Strength of aggregated consensus [0.0, 1.0]
         """
         if not self.models or features.empty:
+            # No model output is unavailable, not a neutral calibrated forecast.
             return {
-                "p_buy": 0.33,
-                "p_sell": 0.33,
+                "p_buy": 0.0,
+                "p_sell": 0.0,
                 "expected_signal": 0.0,
                 "confidence": 0.0,
             }
