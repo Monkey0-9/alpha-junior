@@ -45,6 +45,25 @@ class PreTradeRiskGuard:
         return {"success": False, "status": "rejected", "error": message, **extra}
 
     @staticmethod
+    def _trip_halt(
+        client: AlpacaClient,
+        reason: str,
+        *,
+        symbol: Optional[str] = None,
+        order_id: Optional[str] = None,
+    ) -> None:
+        """Trip persistent execution halt without disabling broker read access."""
+        try:
+            client.trading_halted = True
+            client._trip_execution_halt(reason, symbol=symbol, order_id=order_id)
+        except Exception as exc:
+            logger.critical("Could not persist execution halt: %s", exc)
+            try:
+                ExecutionHaltState.trip(reason, symbol=symbol, order_id=order_id)
+            except Exception as persist_exc:
+                logger.critical("Persistent halt write failed: %s", persist_exc)
+
+    @staticmethod
     def _finite_positive(value: Any, field: str) -> float:
         try:
             number = float(value)
@@ -160,14 +179,13 @@ class PreTradeRiskGuard:
         portfolio_state: Optional[Dict[str, Any]] = None,
         current_qty: float = 0.0,
     ) -> Dict[str, Any]:
-        """Validate, audit, and submit one order; unknown state always rejects."""
+        """Validate, reserve, submit, and durably record exactly one order intent."""
         if ExecutionHaltState.is_halted() or getattr(client, "trading_halted", False):
-            halt = ExecutionHaltState.get_state() or {}
             return self._reject(
-                "Execution circuit breaker is active; reconcile broker orders and positions and clear the halt explicitly.",
+                "Execution circuit breaker is active; reconcile broker orders and positions before retry.",
                 reconciliation_required=True,
                 trading_halted=True,
-                halt_state=halt,
+                halt_state=ExecutionHaltState.get_state() or {},
             )
 
         raw_symbol = order_request.get("symbol")
@@ -180,13 +198,8 @@ class PreTradeRiskGuard:
             return self._reject("Order side must be buy or sell.")
 
         client_order_id = order_request.get("client_order_id")
-        if (
-            not isinstance(client_order_id, str)
-            or not _CLIENT_ORDER_ID_RE.fullmatch(client_order_id)
-        ):
-            return self._reject(
-                "A caller-supplied client_order_id of 16–32 safe characters is required for idempotency."
-            )
+        if not isinstance(client_order_id, str) or not _CLIENT_ORDER_ID_RE.fullmatch(client_order_id):
+            return self._reject("A caller-supplied client_order_id of 16–32 safe characters is required.")
 
         try:
             qty = self._finite_positive(order_request.get("qty"), "Order quantity")
@@ -217,6 +230,89 @@ class PreTradeRiskGuard:
                 return self._reject(
                     "Trailing stops require exactly one of trail_price or trail_percent."
                 )
+
+        # Resolve retries before any market-data work or broker dispatch.
+        intent_request = {
+            "symbol": symbol,
+            "qty": qty,
+            "side": side,
+            "order_type": order_type,
+            "limit_price": prices.get("limit_price"),
+            "stop_price": prices.get("stop_price"),
+            "trail_price": prices.get("trail_price"),
+            "trail_percent": prices.get("trail_percent"),
+            "strategy": order_request.get("strategy", "manual"),
+            "asset_class": order_request.get("asset_class", "equity"),
+            "time_in_force": order_request.get("time_in_force", "day"),
+            "client_order_id": client_order_id,
+        }
+        try:
+            existing_intent = self.governance.get_order_intent(client_order_id)
+            fingerprint = self.governance._intent_fingerprint(intent_request)
+            if existing_intent:
+                if existing_intent.get("intent_fingerprint") != fingerprint:
+                    self._trip_halt(
+                        client,
+                        "Idempotency key reused for a different order intent.",
+                        symbol=symbol,
+                        order_id=client_order_id,
+                    )
+                    return self._reject(
+                        "Idempotency key was already used for a different order intent.",
+                        reconciliation_required=True,
+                        trading_halted=True,
+                    )
+
+                previous_status = str(existing_intent.get("status", "")).upper()
+                if previous_status == "SUBMITTED" and existing_intent.get("broker_order_id"):
+                    if self.governance.has_trade_record(client_order_id):
+                        return {
+                            "success": True,
+                            "status": "SUBMITTED",
+                            "order_id": existing_intent["broker_order_id"],
+                            "client_order_id": client_order_id,
+                            "idempotent_replay": True,
+                        }
+                elif previous_status in {"FILLED", "CANCELLED", "EXPIRED"}:
+                    return {
+                        "success": True,
+                        "status": previous_status,
+                        "order_id": existing_intent.get("broker_order_id"),
+                        "client_order_id": client_order_id,
+                        "idempotent_replay": True,
+                    }
+                elif previous_status == "REJECTED":
+                    return self._reject(
+                        "This idempotency key already represents a rejected order.",
+                        client_order_id=client_order_id,
+                        idempotent_replay=True,
+                    )
+
+                self._trip_halt(
+                    client,
+                    "Order intent is unresolved; duplicate broker dispatch is prohibited.",
+                    symbol=symbol,
+                    order_id=existing_intent.get("broker_order_id") or client_order_id,
+                )
+                return self._reject(
+                    "This idempotency key has an unresolved order intent; reconcile before retry.",
+                    reconciliation_required=True,
+                    trading_halted=True,
+                    order_intent=existing_intent,
+                )
+        except Exception as exc:
+            logger.critical("Order-intent lookup failed; refusing dispatch: %s", exc)
+            self._trip_halt(
+                client,
+                "Order-intent lookup failed; duplicate dispatch cannot be ruled out.",
+                symbol=symbol,
+                order_id=client_order_id,
+            )
+            return self._reject(
+                "Unable to verify order-intent ledger; execution halted.",
+                reconciliation_required=True,
+                trading_halted=True,
+            )
 
         try:
             state = await self._verified_state(client, portfolio_state)
@@ -250,30 +346,18 @@ class PreTradeRiskGuard:
                 return self._reject("Caller position quantity is invalid.")
             if not math.isfinite(supplied_qty):
                 return self._reject("Caller position quantity is non-finite.")
-            # A supplied zero is not an authoritative assertion; compare only
-            # when the caller actually supplies a non-zero holding.
             if abs(supplied_qty) > 1e-9 and abs(abs(supplied_qty) - abs(signed_current_qty)) > 1e-6:
                 return self._reject(
                     "Caller position quantity differs from current broker holdings; refresh and retry.",
                     reconciliation_required=True,
                 )
 
-        trade_compliance_req = {
-            "symbol": symbol,
-            "qty": qty,
-            "side": side,
+        compliance_request = {
+            **intent_request,
             "price": mark,
-            "order_type": order_type,
-            "limit_price": prices.get("limit_price"),
-            "stop_price": prices.get("stop_price"),
-            "trail_price": prices.get("trail_price"),
-            "trail_percent": prices.get("trail_percent"),
-            "strategy": order_request.get("strategy", "manual"),
-            "client_order_id": client_order_id,
             "intent_id": client_order_id,
         }
-
-        validation = PolyglotBridge.validate_order_zig(trade_compliance_req)
+        validation = PolyglotBridge.validate_order_zig(compliance_request)
         if validation.get("valid") is not True:
             return self._reject(
                 f"Order validation failed: {validation.get('error', 'INVALID_ORDER')}"
@@ -281,75 +365,199 @@ class PreTradeRiskGuard:
 
         try:
             approved, violations = self.governance.check_compliance(
-                trade_compliance_req,
+                compliance_request,
                 state,
                 current_qty=signed_current_qty,
             )
         except Exception as exc:
             logger.critical("Governance approval could not be durably audited: %s", exc)
-            client.enabled = False
+            self._trip_halt(
+                client,
+                "Governance audit persistence failed before broker dispatch.",
+                symbol=symbol,
+                order_id=client_order_id,
+            )
             return self._reject(
                 "Governance audit persistence failed; order rejected and execution halted.",
                 trading_halted=True,
+                reconciliation_required=True,
             )
 
         if not approved:
+            return self._reject("Risk limits violated.", violations=violations)
+
+        # Commit APPROVED intent before the broker request. A crash after this
+        # point is detectable at startup and cannot silently create a duplicate.
+        try:
+            reserved = self.governance.prepare_order_intent(compliance_request)
+        except Exception as exc:
+            logger.critical("Durable order-intent reservation failed: %s", exc)
+            self._trip_halt(
+                client,
+                "Order intent could not be durably reserved; broker dispatch blocked.",
+                symbol=symbol,
+                order_id=client_order_id,
+            )
             return self._reject(
-                "Risk limits violated.",
-                violations=violations,
+                "Unable to reserve durable order intent; execution halted.",
+                trading_halted=True,
+                reconciliation_required=True,
+            )
+
+        if not reserved.get("_created"):
+            self._trip_halt(
+                client,
+                "Concurrent request reused an existing order-intent reservation.",
+                symbol=symbol,
+                order_id=client_order_id,
+            )
+            return self._reject(
+                "Order intent already exists; reconcile before retry.",
+                trading_halted=True,
+                reconciliation_required=True,
             )
 
         result = await client.submit_order(
             symbol=symbol,
             qty=qty,
             side=side,
-            asset_class=order_request.get("asset_class", "equity"),
+            asset_class=intent_request["asset_class"],
             order_type=order_type,
-            time_in_force=order_request.get("time_in_force", "day"),
+            time_in_force=intent_request["time_in_force"],
             limit_price=prices.get("limit_price"),
             stop_price=prices.get("stop_price"),
             trail_price=prices.get("trail_price"),
             trail_percent=prices.get("trail_percent"),
-            client_order_id=order_request.get("client_order_id"),
-            strategy=order_request.get("strategy"),
+            client_order_id=client_order_id,
+            strategy=intent_request["strategy"],
             extended_hours=bool(order_request.get("extended_hours", False)),
         )
 
-        if result.get("status") in {"SUBMISSION_UNKNOWN", "UNAUTHORIZED"}:
-            return result
-
-        if result.get("success") or result.get("order_id") or result.get("id"):
+        result_status = str(result.get("status", "")).upper()
+        if result_status == "SUBMISSION_UNKNOWN":
             try:
-                self.governance.record_trade(
-                    {
-                        "symbol": symbol,
-                        "side": side,
-                        "qty": qty,
-                        "price": mark,
-                        "order_type": order_type,
-                        "strategy": order_request.get("strategy", "manual"),
-                        "status": result.get("status", "SUBMITTED"),
-                        "order_id": result.get("order_id") or result.get("id"),
-                        "client_order_id": client_order_id,
-                        "intent_id": client_order_id,
-                    }
+                self.governance.update_order_intent(
+                    client_order_id,
+                    "SUBMISSION_UNKNOWN",
+                    error=result.get("error"),
                 )
             except Exception as exc:
-                logger.critical(
-                    "Broker may have accepted %s but trade lineage persistence failed: %s",
-                    symbol,
-                    exc,
+                logger.critical("Could not persist unknown submission state: %s", exc)
+            self._trip_halt(
+                client,
+                "Broker submission result is unknown.",
+                symbol=symbol,
+                order_id=client_order_id,
+            )
+            return result
+
+        if result_status in {"UNAUTHORIZED", "REJECTED", "IDEMPOTENCY_CONFLICT"} or not result.get("success"):
+            try:
+                status = (
+                    "RECONCILIATION_REQUIRED"
+                    if result.get("reconciliation_required")
+                    else "REJECTED"
                 )
-                client.enabled = False
-                return {
-                    "success": True,
-                    "status": "SUBMITTED_AUDIT_FAILURE",
-                    "order_id": result.get("order_id") or result.get("id"),
-                    "error": "Order may be active at the broker; lineage was not persisted. Do not retry. Reconcile broker orders and positions.",
-                    "reconciliation_required": True,
-                    "trading_halted": True,
+                self.governance.update_order_intent(
+                    client_order_id,
+                    status,
+                    error=result.get("error"),
+                )
+            except Exception as exc:
+                self._trip_halt(
+                    client,
+                    f"Broker rejection state could not be persisted: {exc}",
+                    symbol=symbol,
+                    order_id=client_order_id,
+                )
+                return self._reject(
+                    "Broker outcome could not be durably recorded; execution halted.",
+                    reconciliation_required=True,
+                    trading_halted=True,
+                )
+            return result
+
+        broker_order_id = result.get("order_id") or result.get("id")
+        if not broker_order_id:
+            self._trip_halt(
+                client,
+                "Broker success response omitted order identifier.",
+                symbol=symbol,
+                order_id=client_order_id,
+            )
+            try:
+                self.governance.update_order_intent(
+                    client_order_id,
+                    "RECONCILIATION_REQUIRED",
+                    error="Broker success response omitted order ID.",
+                )
+            except Exception:
+                pass
+            return {
+                "success": False,
+                "status": "SUBMISSION_UNKNOWN",
+                "client_order_id": client_order_id,
+                "error": "Broker response omitted order ID; reconcile by client_order_id before retry.",
+                "reconciliation_required": True,
+                "trading_halted": True,
+            }
+
+        try:
+            self.governance.update_order_intent(
+                client_order_id,
+                "SUBMITTED",
+                broker_order_id=str(broker_order_id),
+            )
+            self.governance.record_trade(
+                {
+                    "symbol": symbol,
+                    "side": side,
+                    "qty": qty,
+                    "price": mark,
+                    "order_type": order_type,
+                    "strategy": intent_request["strategy"],
+                    "status": result.get("status", "SUBMITTED"),
+                    "order_id": str(broker_order_id),
+                    "client_order_id": client_order_id,
+                    "intent_id": client_order_id,
                 }
-        return result
+            )
+        except Exception as exc:
+            logger.critical(
+                "Broker may have accepted %s but intent/lineage persistence failed: %s",
+                symbol,
+                exc,
+            )
+            self._trip_halt(
+                client,
+                "Broker may have accepted an order but durable lineage is incomplete.",
+                symbol=symbol,
+                order_id=str(broker_order_id),
+            )
+            try:
+                self.governance.update_order_intent(
+                    client_order_id,
+                    "RECONCILIATION_REQUIRED",
+                    broker_order_id=str(broker_order_id),
+                    error=str(exc),
+                )
+            except Exception:
+                pass
+            return {
+                "success": True,
+                "status": "SUBMITTED_AUDIT_FAILURE",
+                "order_id": str(broker_order_id),
+                "client_order_id": client_order_id,
+                "error": "Order may be active at broker; intent or history is incomplete. Do not retry; reconcile broker state.",
+                "reconciliation_required": True,
+                "trading_halted": True,
+            }
+
+        return {
+            **result,
+            "order_id": str(broker_order_id),
+            "client_order_id": client_order_id,
+        }
 
     async def validate_and_close_position(
         self, client: AlpacaClient, symbol: str
