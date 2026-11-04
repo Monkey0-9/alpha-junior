@@ -88,11 +88,21 @@ async def list_orders(
 async def get_order_status(
     order_id: str, client: AlpacaClient = Depends(get_alpaca)
 ) -> Dict[str, Any]:
-    orders = await client.get_orders(status="all")
-    for order in orders:
-        if order.get("id") == order_id:
-            return order
-    raise HTTPException(status_code=404, detail="Order not found")
+    try:
+        return await client.get_order(order_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": str(exc),
+                "reconciliation_required": True,
+                "trading_halted": True,
+            },
+        ) from exc
 
 
 @router.post("/order")
@@ -237,6 +247,22 @@ async def get_clock(
 ) -> Dict[str, Any]:
     clock = await client.get_clock()
     return {"status": "success", "clock": clock}
+
+
+@router.get("/execution-halt")
+async def execution_halt_state() -> Dict[str, Any]:
+    from nexus.execution.halt_state import ExecutionHaltState
+
+    state = ExecutionHaltState.get_state()
+    return {"halted": ExecutionHaltState.is_halted(), "state": state}
+
+
+@router.get("/order-intents/unresolved")
+async def unresolved_order_intents() -> Dict[str, Any]:
+    from nexus.audit.governance import GovernanceEngine
+
+    intents = GovernanceEngine().list_unresolved_order_intents()
+    return {"status": "success", "count": len(intents), "intents": intents}
 
 
 @router.get("/health")
