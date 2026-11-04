@@ -433,11 +433,16 @@ class AlpacaClient:
                     self.simulated = False
                     return {"success": False, "status": "UNAUTHORIZED", "error": "Broker credentials rejected."}
                 if response.status == 404:
+                    self._trip_execution_halt(
+                        "Broker returned 404 for cancellation; order state must be reconciled.",
+                        order_id=order_id,
+                    )
                     return {
                         "success": False,
                         "status": "ORDER_NOT_FOUND",
                         "error": "Broker did not find the order; reconcile order and position state.",
                         "reconciliation_required": True,
+                        "trading_halted": True,
                     }
                 data = await response.json()
                 return {
