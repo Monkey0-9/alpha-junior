@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional
 
 from nexus.audit.governance import GovernanceEngine
 from nexus.execution.alpaca import AlpacaClient
+from nexus.execution.halt_state import ExecutionHaltState
 from nexus.utils.config import Config
 from nexus.utils.polyglot_bridge import PolyglotBridge
 
@@ -159,6 +160,15 @@ class PreTradeRiskGuard:
         current_qty: float = 0.0,
     ) -> Dict[str, Any]:
         """Validate, audit, and submit one order; unknown state always rejects."""
+        if ExecutionHaltState.is_halted() or getattr(client, "trading_halted", False):
+            halt = ExecutionHaltState.get_state() or {}
+            return self._reject(
+                "Execution circuit breaker is active; reconcile broker orders and positions and clear the halt explicitly.",
+                reconciliation_required=True,
+                trading_halted=True,
+                halt_state=halt,
+            )
+
         raw_symbol = order_request.get("symbol")
         symbol = raw_symbol.strip().upper() if isinstance(raw_symbol, str) else ""
         if not _SYMBOL_RE.fullmatch(symbol):
@@ -330,6 +340,12 @@ class PreTradeRiskGuard:
         self, client: AlpacaClient, symbol: str
     ) -> Dict[str, Any]:
         """Audit and close an existing position through the same controlled boundary."""
+        if ExecutionHaltState.is_halted() or getattr(client, "trading_halted", False):
+            return self._reject(
+                "Execution circuit breaker is active; reconcile broker state before dispatching position changes.",
+                reconciliation_required=True,
+                trading_halted=True,
+            )
         symbol = symbol.strip().upper()
         if not _SYMBOL_RE.fullmatch(symbol):
             return self._reject("Invalid position symbol.")
