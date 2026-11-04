@@ -254,6 +254,16 @@ class AlpacaClient:
         extended_hours: bool = False,
     ) -> Dict[str, Any]:
         symbol = symbol.upper()
+        if (
+            not isinstance(client_order_id, str)
+            or not re.fullmatch(r"[A-Za-z0-9._-]{16,32}", client_order_id)
+        ):
+            return {
+                "success": False,
+                "status": "REJECTED",
+                "error": "A caller-supplied 16–32 character client_order_id is required for idempotent order submission.",
+                "asset_class": asset_class,
+            }
         if self.trading_halted or ExecutionHaltState.is_halted():
             return {
                 "success": False,
@@ -271,7 +281,14 @@ class AlpacaClient:
         if self.simulated:
             result: Dict[str, Any]
             bars = await self.get_bars(symbol, timeframe="1Min", limit=1)
-            current_price = float(bars[-1]["close"]) if bars else 100.0
+            if not bars:
+                return {
+                    "success": False,
+                    "status": "REJECTED",
+                    "error": "No simulated market mark is available; order rejected.",
+                    "asset_class": asset_class,
+                }
+            current_price = float(bars[-1].get("close", bars[-1].get("c", 0.0)))
             if order_type == "limit" and limit_price is not None:
                 result = self.simulator.execute_limit_order(
                     symbol, qty, limit_price, side
@@ -297,6 +314,9 @@ class AlpacaClient:
             return {
                 **result,
                 "success": True,
+                "id": client_order_id,
+                "order_id": client_order_id,
+                "client_order_id": client_order_id,
                 "simulated": True,
                 "asset_class": asset_class,
                 "strategy": strategy or "default",
@@ -333,13 +353,7 @@ class AlpacaClient:
                 order_data["trail_price"] = round_price(trail_price)
             if trail_percent is not None:
                 order_data["trail_percent"] = str(round(trail_percent, 6))
-            if client_order_id:
-                order_data["client_order_id"] = client_order_id[:32]
-            else:
-                unique_suffix = uuid.uuid4().hex[:8]
-                fallback_prefix = (strategy or "order").replace(" ", "_")
-                base_order_id = f"{symbol}-{side}-{fallback_prefix}-{unique_suffix}"
-                order_data["client_order_id"] = base_order_id[:32]
+            order_data["client_order_id"] = client_order_id
 
             async with session.post(
                 f"{self.base_url}/v2/orders",
@@ -348,11 +362,43 @@ class AlpacaClient:
             ) as response:
                 data = await response.json()
                 if response.status in {200, 201}:
+                    broker_order_id = data.get("id")
+                    if not broker_order_id:
+                        self._trip_execution_halt(
+                            "Broker accepted an order request but omitted its order identifier.",
+                            symbol=symbol,
+                            order_id=client_order_id,
+                        )
+                        return {
+                            "success": False,
+                            "status": "SUBMISSION_UNKNOWN",
+                            "error": "Broker response omitted order ID; reconcile by client_order_id before retry.",
+                            "client_order_id": client_order_id,
+                            "reconciliation_required": True,
+                            "trading_halted": True,
+                        }
                     return {
                         "success": True,
-                        "id": data.get("id"),
-                        "order_id": data.get("id"),
+                        "id": broker_order_id,
+                        "order_id": broker_order_id,
+                        "client_order_id": client_order_id,
                         "status": data.get("status"),
+                        "asset_class": asset_class,
+                        "raw": data,
+                    }
+                if response.status == 409:
+                    self._trip_execution_halt(
+                        "Broker rejected a client_order_id as conflicting; reconcile the existing intent.",
+                        symbol=symbol,
+                        order_id=client_order_id,
+                    )
+                    return {
+                        "success": False,
+                        "status": "IDEMPOTENCY_CONFLICT",
+                        "error": "client_order_id conflict; reconcile existing broker order before retry.",
+                        "client_order_id": client_order_id,
+                        "reconciliation_required": True,
+                        "trading_halted": True,
                         "asset_class": asset_class,
                         "raw": data,
                     }
