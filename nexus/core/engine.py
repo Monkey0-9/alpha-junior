@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+import uuid
 import httpx
 import numpy as np
 import pandas as pd
@@ -66,6 +67,7 @@ class NexusEngine:
         # Tracking Submitted Orders
         self._active_orders: Dict[str, str] = {}  # symbol -> order_id
         self._execution_halted = ExecutionHaltState.is_halted()
+        self._cycle_id = uuid.uuid4().hex
 
         # Superhuman Brain: drawdown velocity tracker
         self._equity_history: List[float] = []  # recent equity snapshots
@@ -384,6 +386,7 @@ class NexusEngine:
 
     async def run_cycle(self) -> None:
         logger.info("Starting new trading cycle.")
+        self._cycle_id = uuid.uuid4().hex
         if time.time() - self.last_universe_refresh > Config.UNIVERSE_RESCAN_INTERVAL:
             await self.refresh_universe()
 
@@ -703,12 +706,17 @@ class NexusEngine:
             order_type = "limit"
             limit_price = current_price * (1.002 if side == "buy" else 0.998)
 
+        client_order_id = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"alpha-junior:{self._cycle_id}:{symbol}:{side}:{qty}:{selected_strategy}",
+        ).hex[:32]
         payload: Dict[str, Any] = {
             "symbol": symbol,
             "qty": qty,
             "side": side,
             "order_type": order_type,
             "strategy": selected_strategy,
+            "client_order_id": client_order_id,
         }
         if limit_price is not None:
             payload["limit_price"] = round(limit_price, 4)
