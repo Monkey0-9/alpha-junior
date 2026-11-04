@@ -30,7 +30,10 @@ def _get_db() -> sqlite3.Connection:
             qty       REAL,
             price     REAL,
             status    TEXT    NOT NULL,
-            details   TEXT
+            details   TEXT,
+            client_order_id TEXT,
+            order_type TEXT,
+            strategy TEXT
         )""")
     conn.execute("""CREATE TABLE IF NOT EXISTS trade_history (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -41,8 +44,36 @@ def _get_db() -> sqlite3.Connection:
             price       REAL,
             order_type  TEXT,
             strategy    TEXT,
-            status      TEXT    NOT NULL
+            status      TEXT    NOT NULL,
+            order_id TEXT,
+            client_order_id TEXT,
+            intent_id TEXT
         )""")
+
+    # Additive schema migrations for installations created by earlier versions.
+    migrations = {
+        "audit_log": {
+            "client_order_id": "TEXT",
+            "order_type": "TEXT",
+            "strategy": "TEXT",
+        },
+        "trade_history": {
+            "order_id": "TEXT",
+            "client_order_id": "TEXT",
+            "intent_id": "TEXT",
+        },
+    }
+    for table, columns in migrations.items():
+        existing = {
+            row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        for column, sql_type in columns.items():
+            if column not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_history_client_order_id "
+        "ON trade_history(client_order_id) WHERE client_order_id IS NOT NULL"
+    )
     conn.commit()
     return conn
 
@@ -178,8 +209,9 @@ class GovernanceEngine:
         try:
             self._db.execute(
                 "INSERT INTO audit_log "
-                "(timestamp, symbol, side, qty, price, status, details) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "(timestamp, symbol, side, qty, price, status, details, "
+                "client_order_id, order_type, strategy) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     entry["timestamp"],
                     request["symbol"],
@@ -188,6 +220,9 @@ class GovernanceEngine:
                     request.get("price"),
                     status,
                     json.dumps(entry["details"]),
+                    request.get("client_order_id"),
+                    request.get("order_type"),
+                    request.get("strategy"),
                 ),
             )
             self._db.commit()
@@ -208,13 +243,34 @@ class GovernanceEngine:
         logger.info(msg)
 
     def record_trade(self, trade: Dict[str, Any]) -> None:
-        """Persist a completed trade to the history table."""
+        """Persist broker order lineage; identical idempotency IDs are safe to replay."""
+        client_order_id = trade.get("client_order_id")
         try:
+            if client_order_id:
+                existing = self._db.execute(
+                    "SELECT order_id, symbol, side, qty, price FROM trade_history "
+                    "WHERE client_order_id = ?",
+                    (client_order_id,),
+                ).fetchone()
+                if existing:
+                    _, existing_symbol, existing_side, existing_qty, existing_price = existing
+                    identical = (
+                        existing_symbol == trade.get("symbol")
+                        and existing_side == trade.get("side")
+                        and abs(float(existing_qty or 0.0) - float(trade.get("qty") or 0.0)) < 1e-9
+                        and abs(float(existing_price or 0.0) - float(trade.get("price") or 0.0)) < 1e-6
+                    )
+                    if not identical:
+                        raise RuntimeError(
+                            "Client order ID already exists with a different trade intent."
+                        )
+                    return
+
             self._db.execute(
                 "INSERT INTO trade_history "
-                "(timestamp, symbol, side, qty, price, "
-                "order_type, strategy, status) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "(timestamp, symbol, side, qty, price, order_type, strategy, status, "
+                "order_id, client_order_id, intent_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     datetime.datetime.now().isoformat(),
                     trade.get("symbol"),
@@ -223,7 +279,10 @@ class GovernanceEngine:
                     trade.get("price"),
                     trade.get("order_type"),
                     trade.get("strategy"),
-                    trade.get("status", "EXECUTED"),
+                    trade.get("status", "SUBMITTED"),
+                    trade.get("order_id"),
+                    client_order_id,
+                    trade.get("intent_id"),
                 ),
             )
             self._db.commit()
@@ -234,3 +293,5 @@ class GovernanceEngine:
                 pass
             logger.critical("Trade history persistence failed: %s", exc)
             raise RuntimeError("Unable to durably persist trade lineage.") from exc
+
+
