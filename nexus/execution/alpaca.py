@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 from nexus.research.simulator import TradeSimulator
 from nexus.utils.config import Config
 from nexus.data.cache_layer import MarketDataCache
+from nexus.execution.halt_state import ExecutionHaltState
 
 # Load environment variables
 load_dotenv()
@@ -46,6 +47,7 @@ class AlpacaClient:
         self.session: Optional[aiohttp.ClientSession] = None
         self.simulator = TradeSimulator()
         self.simulated = False
+        self.trading_halted = ExecutionHaltState.is_halted()
         self._bars_cache: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
         self._bars_inflight: Dict[Tuple[Any, ...], asyncio.Task[List[Dict[str, Any]]]] = {}
         self._bars_cache_ttl = 15.0
@@ -94,6 +96,28 @@ class AlpacaClient:
             logger.info("Alpaca execution initialized in SIMULATION mode.")
         else:
             logger.warning("Alpaca execution disabled due to missing credentials.")
+
+    def _trip_execution_halt(
+        self, reason: str, *, symbol: Optional[str] = None, order_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Persist an ambiguous execution state; never rely on process memory alone."""
+        self.trading_halted = True
+        try:
+            return ExecutionHaltState.trip(
+                reason, symbol=symbol, order_id=order_id
+            )
+        except Exception as exc:
+            logger.critical(
+                "Persistent execution halt could not be written; in-process halt remains active: %s",
+                exc,
+            )
+            return {
+                "halted": True,
+                "reason": reason,
+                "symbol": symbol,
+                "order_id": order_id,
+                "persist_error": str(exc),
+            }
 
     @property
     def headers(self) -> Dict[str, str]:
@@ -230,6 +254,14 @@ class AlpacaClient:
         extended_hours: bool = False,
     ) -> Dict[str, Any]:
         symbol = symbol.upper()
+        if self.trading_halted or ExecutionHaltState.is_halted():
+            return {
+                "success": False,
+                "status": "EXECUTION_HALTED",
+                "error": "Execution is halted pending operator-confirmed broker reconciliation.",
+                "reconciliation_required": True,
+                "trading_halted": True,
+            }
         if not self.enabled and not self.simulated:
             logger.error("submit_order rejected: Alpaca execution client is disabled or unauthenticated.")
             return {
@@ -345,8 +377,11 @@ class AlpacaClient:
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             # A timeout after POST may still mean the broker accepted the order.
             logger.critical("Order submission outcome unknown for %s: %s", symbol, exc)
-            self.enabled = False
-            self.simulated = False
+            self._trip_execution_halt(
+                "Order submission timed out; broker acceptance is unknown.",
+                symbol=symbol,
+                order_id=client_order_id,
+            )
             return {
                 "success": False,
                 "status": "SUBMISSION_UNKNOWN",
@@ -412,8 +447,10 @@ class AlpacaClient:
                 }
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             logger.critical("Order cancellation outcome unknown for %s: %s", order_id, exc)
-            self.enabled = False
-            self.simulated = False
+            self._trip_execution_halt(
+                "Order cancellation timed out; broker cancellation state is unknown.",
+                order_id=order_id,
+            )
             return {
                 "success": False,
                 "status": "CANCEL_OUTCOME_UNKNOWN",
@@ -646,8 +683,10 @@ class AlpacaClient:
                 }
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             logger.critical("Close outcome unknown for %s: %s", symbol, exc)
-            self.enabled = False
-            self.simulated = False
+            self._trip_execution_halt(
+                "Position close timed out; broker close state is unknown.",
+                symbol=symbol,
+            )
             return {
                 "success": False,
                 "status": "CLOSE_OUTCOME_UNKNOWN",
