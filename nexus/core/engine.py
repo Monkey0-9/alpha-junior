@@ -180,6 +180,48 @@ class NexusEngine:
             logger.error("Unable to reach execution backend.")
             return False
 
+        # On process start, recover the broker's working orders before the
+        # scheduler can create a new intent. An unavailable orders endpoint is
+        # not evidence that the broker has no open orders.
+        if not self._execution_halted and not ExecutionHaltState.is_halted():
+            try:
+                orders_response = await client.get(
+                    f"{self.backend_url}/api/alpaca/orders",
+                    params={"status": "open", "limit": 500},
+                )
+                orders_response.raise_for_status()
+                orders_payload = orders_response.json()
+                open_orders = orders_payload.get("orders")
+                if not isinstance(open_orders, list):
+                    raise RuntimeError("Broker open-orders response is malformed.")
+                terminal_statuses = {"filled", "canceled", "cancelled", "expired", "rejected"}
+                for order in open_orders:
+                    if not isinstance(order, dict):
+                        raise RuntimeError("Broker returned malformed open-order record.")
+                    order_id = order.get("id") or order.get("order_id")
+                    symbol = order.get("symbol")
+                    status = str(order.get("status", "")).lower()
+                    if status in terminal_statuses:
+                        continue
+                    if not order_id or not symbol:
+                        raise RuntimeError("Open order is missing broker order ID or symbol.")
+                    self._active_orders[str(symbol).upper()] = str(order_id)
+                    self._trip_execution_halt(
+                        f"Broker has an unresolved open order on startup (status={status or 'UNKNOWN'}).",
+                        symbol=str(symbol).upper(),
+                        order_id=str(order_id),
+                    )
+            except Exception as exc:
+                logger.critical(
+                    "Startup broker order reconciliation failed; engine cannot enable entries: %s",
+                    exc,
+                )
+                self.health_monitor.record(
+                    "broker", False, details="Startup open-order reconciliation failed"
+                )
+                self.health_monitor.heartbeat()
+                return False
+
         # High-speed Go Audit
         audit = PolyglotBridge.audit_platform_go(self.backend_url)
         logger.info(f"Polyglot Audit Status: {audit.get('overall_health')}")
@@ -368,13 +410,17 @@ class NexusEngine:
                     logger.info("Order %s for %s finalized: %s", order_id, symbol, status)
                     self._active_orders.pop(symbol, None)
                 else:
-                    # Open, partially filled, missing, or unfamiliar statuses all
-                    # remain tracked and prevent new orders until terminal/reconciled.
+                    # Any non-terminal broker state must survive process restarts.
                     logger.warning(
-                        "Order %s for %s is unresolved (status=%s). New entries remain blocked.",
+                        "Order %s for %s is unresolved (status=%s); tripping persistent halt.",
                         order_id,
                         symbol,
                         status or "UNKNOWN",
+                    )
+                    self._trip_execution_halt(
+                        f"Open or partially filled broker order remains unresolved (status={status or 'UNKNOWN'}).",
+                        symbol=symbol,
+                        order_id=order_id,
                     )
             except Exception as exc:
                 logger.error("Error reconciling order %s for %s: %s", order_id, symbol, exc)
