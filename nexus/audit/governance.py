@@ -1,5 +1,6 @@
 import datetime
 import json
+import hashlib
 import logging
 import os
 import sqlite3
@@ -74,6 +75,22 @@ def _get_db() -> sqlite3.Connection:
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_history_client_order_id "
         "ON trade_history(client_order_id) WHERE client_order_id IS NOT NULL"
     )
+    conn.execute("""CREATE TABLE IF NOT EXISTS order_intents (
+        client_order_id TEXT PRIMARY KEY,
+        intent_fingerprint TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        side TEXT NOT NULL,
+        qty REAL NOT NULL,
+        order_type TEXT NOT NULL,
+        strategy TEXT,
+        status TEXT NOT NULL,
+        broker_order_id TEXT,
+        error TEXT,
+        reconciliation_reference TEXT,
+        reconciled_by TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )""")
     conn.commit()
     return conn
 
@@ -241,6 +258,179 @@ class GovernanceEngine:
             f"{request['symbol']} - {entry['details']}"
         )
         logger.info(msg)
+
+    @staticmethod
+    def _intent_fingerprint(request: Dict[str, Any]) -> str:
+        """Hash business intent fields; live market mark is not an order parameter."""
+        payload = {
+            "symbol": str(request.get("symbol", "")).upper(),
+            "side": str(request.get("side", "")).lower(),
+            "qty": float(request.get("qty", 0.0)),
+            "order_type": str(request.get("order_type", "market")).lower(),
+            "limit_price": request.get("limit_price"),
+            "stop_price": request.get("stop_price"),
+            "trail_price": request.get("trail_price"),
+            "trail_percent": request.get("trail_percent"),
+            "time_in_force": request.get("time_in_force", "day"),
+            "asset_class": request.get("asset_class", "equity"),
+            "strategy": request.get("strategy"),
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def get_order_intent(self, client_order_id: str) -> Optional[Dict[str, Any]]:
+        row = self._db.execute(
+            "SELECT client_order_id, intent_fingerprint, symbol, side, qty, order_type, "
+            "strategy, status, broker_order_id, error, reconciliation_reference, "
+            "reconciled_by, created_at, updated_at FROM order_intents WHERE client_order_id = ?",
+            (client_order_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        keys = (
+            "client_order_id", "intent_fingerprint", "symbol", "side", "qty",
+            "order_type", "strategy", "status", "broker_order_id", "error",
+            "reconciliation_reference", "reconciled_by", "created_at", "updated_at",
+        )
+        return dict(zip(keys, row, strict=True))
+
+    def get_order_intent_by_broker_order_id(
+        self, broker_order_id: str
+    ) -> Optional[Dict[str, Any]]:
+        row = self._db.execute(
+            "SELECT client_order_id FROM order_intents WHERE broker_order_id = ?",
+            (broker_order_id,),
+        ).fetchone()
+        return self.get_order_intent(row[0]) if row else None
+
+    def prepare_order_intent(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Persist APPROVED before dispatch; duplicate keys never create new orders."""
+        client_order_id = request.get("client_order_id")
+        if not isinstance(client_order_id, str) or not client_order_id:
+            raise ValueError("client_order_id is required for an order intent.")
+        fingerprint = self._intent_fingerprint(request)
+        existing = self.get_order_intent(client_order_id)
+        if existing:
+            if existing["intent_fingerprint"] != fingerprint:
+                raise RuntimeError(
+                    "Idempotency key was already used for a different order intent."
+                )
+            return existing
+
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        try:
+            self._db.execute(
+                "INSERT INTO order_intents "
+                "(client_order_id, intent_fingerprint, symbol, side, qty, order_type, "
+                "strategy, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    client_order_id,
+                    fingerprint,
+                    request["symbol"],
+                    request["side"],
+                    float(request["qty"]),
+                    request.get("order_type", "market"),
+                    request.get("strategy"),
+                    "APPROVED",
+                    now,
+                    now,
+                ),
+            )
+            self._db.commit()
+        except sqlite3.Error as exc:
+            try:
+                self._db.rollback()
+            except sqlite3.Error:
+                pass
+            logger.critical("Order intent persistence failed; refusing broker dispatch: %s", exc)
+            raise RuntimeError("Unable to durably persist order intent.") from exc
+        result = self.get_order_intent(client_order_id)
+        if result is None:
+            raise RuntimeError("Persisted order intent could not be reloaded.")
+        return result
+
+    def update_order_intent(
+        self,
+        client_order_id: str,
+        status: str,
+        *,
+        broker_order_id: Optional[str] = None,
+        error: Optional[str] = None,
+        operator: Optional[str] = None,
+        reconciliation_reference: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Update an intent state with explicit terminal/reconciliation metadata."""
+        allowed = {
+            "APPROVED",
+            "SUBMITTED",
+            "PARTIALLY_FILLED",
+            "FILLED",
+            "CANCELLED",
+            "EXPIRED",
+            "REJECTED",
+            "SUBMISSION_UNKNOWN",
+            "RECONCILIATION_REQUIRED",
+        }
+        new_status = status.upper()
+        if new_status not in allowed:
+            raise ValueError(f"Unsupported order-intent status: {status}")
+        existing = self.get_order_intent(client_order_id)
+        if existing is None:
+            raise KeyError(f"Unknown client_order_id: {client_order_id}")
+
+        terminal = {"FILLED", "CANCELLED", "EXPIRED", "REJECTED"}
+        current_status = existing["status"]
+        if current_status in terminal and current_status != new_status:
+            raise RuntimeError(
+                f"Cannot change terminal order intent {current_status} to {new_status}."
+            )
+
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        try:
+            self._db.execute(
+                "UPDATE order_intents SET status = ?, broker_order_id = COALESCE(?, broker_order_id), "
+                "error = ?, reconciled_by = COALESCE(?, reconciled_by), "
+                "reconciliation_reference = COALESCE(?, reconciliation_reference), updated_at = ? "
+                "WHERE client_order_id = ?",
+                (
+                    new_status,
+                    broker_order_id,
+                    error,
+                    operator,
+                    reconciliation_reference,
+                    now,
+                    client_order_id,
+                ),
+            )
+            self._db.commit()
+        except sqlite3.Error as exc:
+            try:
+                self._db.rollback()
+            except sqlite3.Error:
+                pass
+            logger.critical("Order intent update failed for %s: %s", client_order_id, exc)
+            raise RuntimeError("Unable to durably update order intent.") from exc
+
+        result = self.get_order_intent(client_order_id)
+        if result is None:
+            raise RuntimeError("Updated order intent could not be reloaded.")
+        return result
+
+    def list_unresolved_order_intents(self) -> List[Dict[str, Any]]:
+        """Return intents that can represent a crash between approval and final ledger write."""
+        rows = self._db.execute(
+            "SELECT i.client_order_id FROM order_intents i "
+            "LEFT JOIN trade_history t ON t.client_order_id = i.client_order_id "
+            "WHERE i.status IN ('APPROVED', 'SUBMISSION_UNKNOWN', 'RECONCILIATION_REQUIRED', 'PARTIALLY_FILLED') "
+            "OR (i.status = 'SUBMITTED' AND t.id IS NULL) "
+            "ORDER BY i.created_at"
+        ).fetchall()
+        return [
+            intent
+            for row in rows
+            if (intent := self.get_order_intent(row[0])) is not None
+        ]
 
     def record_trade(self, trade: Dict[str, Any]) -> None:
         """Persist broker order lineage; identical idempotency IDs are safe to replay."""
