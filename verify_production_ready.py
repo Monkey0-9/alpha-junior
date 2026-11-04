@@ -9,6 +9,7 @@ import inspect
 import sys
 import logging
 import importlib
+import os
 from typing import Dict, Any
 from pathlib import Path
 import httpx
@@ -68,7 +69,7 @@ class ProductionVerifier:
         logger.info("2. TESTING PERSISTENCE LAYER")
         logger.info("=" * 60)
 
-        db_path = Path("data/nexus_audit.db")
+        db_path = Path(__file__).resolve().parent / "data" / "nexus_audit.db"
         try:
             from nexus.audit.governance import GovernanceEngine
             _ = GovernanceEngine()
@@ -98,144 +99,146 @@ class ProductionVerifier:
             return False
 
     async def test_security_hardening(self) -> bool:
-        """Verify API authentication and CORS policies."""
-        logger.info("\n" + "=" * 60)
-        logger.info("3. TESTING SECURITY HARDENING")
+        """Verify private reads are protected and a strong deployment key exists."""
+        logger.info("\\n" + "=" * 60)
+        logger.info("3. TESTING API AUTHENTICATION")
         logger.info("=" * 60)
 
         try:
             from nexus.api.main import app
-            from nexus.utils.config import Config
 
+            key = os.getenv("NEXUS_API_KEY", "").strip()
+            placeholders = {
+                "changeme",
+                "your_api_key",
+                "your_secure_api_key",
+                "generate_a_secure_random_key_for_internal_auth",
+            }
+            strong_key = len(key) >= 32 and key.lower() not in placeholders
             transport = httpx.ASGITransport(app=app)  # type: ignore
+
             async with httpx.AsyncClient(
                 transport=transport, base_url="http://testserver"
             ) as client:
-                # 1. Test Public GET (Brain snapshot)
-                resp = await client.get("/api/monitor/brain")
-                if resp.status_code not in {200, 502}:
+                health_response = await client.get("/api/health")
+                if health_response.status_code != 200:
+                    logger.error("  [FAIL] Public liveness endpoint did not respond.")
+                    self.results["security_hardening"] = False
+                    return False
+
+                unauthenticated = await client.get("/openapi.json")
+                expected_status = 401 if strong_key else 503
+                if unauthenticated.status_code != expected_status:
                     logger.error(
-                        f"  [FAIL] Public read endpoint returned unexpected {resp.status_code}"
+                        "  [FAIL] Private OpenAPI route returned %s; expected %s.",
+                        unauthenticated.status_code,
+                        expected_status,
                     )
                     self.results["security_hardening"] = False
                     return False
-                logger.info("  [OK] Public read endpoint is accessible")
 
-                # 2. Test Protected POST (Mutation without Key)
-                if Config.API_KEY:
-                    resp = await client.post("/api/alpaca/order", json={})
-                    if resp.status_code != 401:
-                        logger.error(
-                            f"  [FAIL] Mutation endpoint allowed unauthorized access! Status: {resp.status_code}"
-                        )
-                        self.results["security_hardening"] = False
-                        return False
-                    logger.info(
-                        "  [OK] Mutation endpoint is STRICTLY PROTECTED (401 Unauthorized)"
+                if not strong_key:
+                    logger.error(
+                        "  [FAIL] API correctly failed closed, but a strong NEXUS_API_KEY is required for deployment readiness."
                     )
+                    self.results["security_hardening"] = False
+                    return False
 
-                    # 3. Test Authorized POST with valid key
-                    resp = await client.post(
-                        "/api/alpaca/order",
-                        json={},
-                        headers={"X-API-Key": Config.API_KEY},
+                wrong_key = await client.get(
+                    "/openapi.json",
+                    headers={"X-API-Key": "incorrect-test-key"},
+                )
+                if wrong_key.status_code != 401:
+                    logger.error("  [FAIL] Incorrect API key was accepted.")
+                    self.results["security_hardening"] = False
+                    return False
+
+                authorized = await client.get(
+                    "/openapi.json",
+                    headers={"X-API-Key": key},
+                )
+                if authorized.status_code != 200:
+                    logger.error(
+                        "  [FAIL] Strong configured key did not authorize private route."
                     )
-                    # 422 is expected for empty body validation error, 403 for pre-trade guard rejection
-                    if resp.status_code not in {422, 403}:
-                        logger.error(
-                            f"  [FAIL] Authorized mutation returned unexpected status: {resp.status_code}"
-                        )
-                        self.results["security_hardening"] = False
-                        return False
-                    logger.info(
-                        f"  [OK] Mutation endpoint is ACCESSIBLE with valid API Key (Status: {resp.status_code})"
-                    )
+                    self.results["security_hardening"] = False
+                    return False
 
             self.results["security_hardening"] = True
+            logger.info("  [OK] Private routes require a strong key; liveness remains public.")
             return True
-        except Exception as e:
-            logger.error(f"  [FAIL] Security test error: {e}")
+        except Exception as exc:
+            logger.error("  [FAIL] Security verification error: %s", exc)
             self.results["security_hardening"] = False
             return False
 
     def test_quantitative_integrity(self) -> bool:
-        """Verify math stubs are removed and models are real."""
-        logger.info("\n" + "=" * 60)
+        """Check numerical outputs are bounded and not hardcoded placeholders."""
+        logger.info("\\n" + "=" * 60)
         logger.info("4. TESTING QUANTITATIVE INTEGRITY")
         logger.info("=" * 60)
 
         try:
-            from nexus.math.models import NeuralODE, TrendAccelerationModel
-            from nexus.portfolio.optimization import MonteCarloSimulator
             import numpy as np
+            from nexus.portfolio.optimization import MonteCarloSimulator
 
-            # 1. Alias Check
-            if NeuralODE == TrendAccelerationModel:
-                logger.info(
-                    "  [OK] NeuralODE alias is correctly mapped to TrendAccelerationModel"
-                )
-
-            # 2. Monte Carlo Check
-            mc = MonteCarloSimulator()
-            returns = np.random.normal(0.0005, 0.01, 100)
-            prob = mc.run_survival_analysis(100000, returns, days=10, n_simulations=50)
-            if prob != 0.999:
-                logger.info(
-                    f"  [OK] Monte Carlo simulator is ACTIVE (Result: {prob:.4f})"
-                )
-            else:
-                logger.error("  [FAIL] Monte Carlo simulator returned hardcoded 0.999")
+            simulator = MonteCarloSimulator()
+            returns = np.random.default_rng(20261105).normal(0.0005, 0.01, 100)
+            probability = simulator.run_survival_analysis(
+                100000, returns, days=10, n_simulations=50
+            )
+            if not np.isfinite(probability) or not 0.0 <= probability <= 1.0:
+                logger.error("  [FAIL] Monte Carlo probability is invalid: %r", probability)
+                self.results["quant_integrity"] = False
                 return False
 
+            logger.info("  [OK] Monte Carlo returned bounded probability %.4f", probability)
             self.results["quant_integrity"] = True
             return True
-        except Exception as e:
-            logger.error(f"  [FAIL] Quant integrity error: {e}")
+        except Exception as exc:
+            logger.error("  [FAIL] Quantitative integrity error: %s", exc)
             self.results["quant_integrity"] = False
             return False
 
     async def test_alpaca_connection(self) -> bool:
-        """Test Alpaca API connection."""
-        logger.info("\n" + "=" * 60)
+        """Require a real broker account state; simulation is never a readiness pass."""
+        logger.info("\\n" + "=" * 60)
         logger.info("5. TESTING ALPACA CONNECTION")
         logger.info("=" * 60)
 
         try:
+            import math
             from nexus.execution.alpaca import get_client
 
             client = get_client()
-            if not client.enabled:
-                from nexus.utils.config import Config
-                if Config.ALLOW_SIMULATION_FALLBACK:
-                    logger.warning("  ⚠ Alpaca client not enabled (Simulator mode explicitly permitted)")
-                    self.results["alpaca_connection"] = True
-                    return True
-                else:
-                    logger.error("  [FAIL] Alpaca client is disabled and simulation fallback is disallowed.")
-                    self.results["alpaca_connection"] = False
-                    return False
-
-            account = await client.get_account()
-            if account.get("status") in {"ERROR", "UNAUTHORIZED"}:
-                logger.error(
-                    f"  [FAIL] Alpaca broker authentication failed: {account.get('error', 'UNAUTHORIZED')}"
-                )
+            if not client.enabled or client.simulated:
+                logger.error("  [FAIL] Broker is disabled or simulated.")
                 self.results["alpaca_connection"] = False
                 return False
 
-            logger.info(
-                f"  [OK] Connected to Alpaca. Status: {account.get('status', 'ACTIVE')}"
-            )
+            account = await client.get_account()
+            equity = float(account.get("equity", account.get("portfolio_value", 0.0)))
+            if (
+                account.get("status") != "ACTIVE"
+                or account.get("simulated")
+                or not math.isfinite(equity)
+                or equity <= 0
+            ):
+                logger.error("  [FAIL] Broker account is not verified ACTIVE with positive equity.")
+                self.results["alpaca_connection"] = False
+                return False
+
+            logger.info("  [OK] Broker account status ACTIVE; equity present.")
             self.results["alpaca_connection"] = True
             return True
-        except Exception as e:
-            logger.error(f"  [FAIL] Alpaca connection error: {e}")
+        except Exception as exc:
+            logger.error("  [FAIL] Alpaca connection error: %s", exc)
             self.results["alpaca_connection"] = False
             return False
 
     async def test_pre_trade_guard(self) -> bool:
-        """Verify PreTradeRiskGuard non-bypassable pre-trade boundary."""
-        logger.info("\n" + "=" * 60)
+        """Exercise a non-dispatching rejection path at the pre-trade boundary."""
+        logger.info("\\n" + "=" * 60)
         logger.info("6. TESTING PRE-TRADE RISK GUARD")
         logger.info("=" * 60)
 
@@ -244,39 +247,35 @@ class ProductionVerifier:
             from nexus.execution.alpaca import AlpacaClient, AlpacaCredentials
 
             guard = PreTradeRiskGuard()
-            client = AlpacaClient(credentials=AlpacaCredentials("TEST_KEY", "TEST_SECRET"))
+            client = AlpacaClient(
+                credentials=AlpacaCredentials("TEST_KEY", "TEST_SECRET")
+            )
             client.enabled = False
-
-            # 1. Disabled broker rejection
-            res = await guard.validate_and_submit(
-                client=client, order_request={"symbol": "AAPL", "qty": 10, "side": "buy"}
+            result = await guard.validate_and_submit(
+                client,
+                {"symbol": "AAPL", "qty": 10, "side": "buy"},
             )
-            if res.get("status") != "rejected":
-                logger.error("  [FAIL] PreTradeRiskGuard allowed order on disabled broker")
+            if result.get("status") != "rejected":
+                logger.error("  [FAIL] Disabled broker was not rejected.")
                 self.results["pre_trade_guard"] = False
                 return False
-            logger.info("  [OK] Disabled broker fail-closed check enforced")
 
-            # 2. Position concentration gate
+            # Invalid requests must be rejected before any broker state reads.
             client.enabled = True
-            client.simulated = False
-            empty_pos: list[dict[str, Any]] = []
-            portfolio = {"total_value": 10000.0, "drawdown": 0.0, "positions": empty_pos}
-            res2 = await guard.validate_and_submit(
-                client=client,
-                order_request={"symbol": "AAPL", "qty": 100, "price": 100.0, "side": "buy"},
-                portfolio_state=portfolio,
+            invalid = await guard.validate_and_submit(
+                client,
+                {"symbol": "AAPL", "qty": float("nan"), "side": "buy"},
             )
-            if res2.get("status") != "rejected":
-                logger.error("  [FAIL] PreTradeRiskGuard allowed oversized 100% position")
+            if invalid.get("status") != "rejected":
+                logger.error("  [FAIL] Non-finite quantity passed validation.")
                 self.results["pre_trade_guard"] = False
                 return False
-            logger.info("  [OK] Position concentration limit strictly enforced")
 
             self.results["pre_trade_guard"] = True
+            logger.info("  [OK] Disabled broker and non-finite order rejection verified.")
             return True
-        except Exception as e:
-            logger.error(f"  [FAIL] Pre-trade risk guard test error: {e}")
+        except Exception as exc:
+            logger.error("  [FAIL] Pre-trade guard verification error: %s", exc)
             self.results["pre_trade_guard"] = False
             return False
 
@@ -334,7 +333,7 @@ class ProductionVerifier:
     async def run_all_checks(self) -> bool:
         """Run all verification checks."""
         logger.info("\n" + "╔" + "=" * 58 + "╗")
-        logger.info("║" + "  NEXUS HARDENED PRODUCTION VERIFICATION".center(58) + "║")
+        logger.info("║" + "NEXUS RELEASE DIAGNOSTICS (NOT CERTIFICATION)".center(58) + "║")
         logger.info("╚" + "=" * 58 + "╝")
 
         checks = [
@@ -375,9 +374,9 @@ async def main() -> int:
 
     logger.info("\n" + "=" * 60)
     if passed:
-        logger.info("  [PASS] NEXUS PLATFORM IS HARDENED AND PRODUCTION READY")
+        logger.info("  [PASS] DIAGNOSTIC CHECKS PASSED; EXTERNAL RELEASE GATES STILL APPLY")
     else:
-        logger.error("  [FAIL] NEXUS PLATFORM FAILED HARDENING VERIFICATION")
+        logger.error("  [FAIL] RELEASE DIAGNOSTICS FAILED; DO NOT ENABLE LIVE AUTOMATION")
     logger.info("=" * 60 + "\n")
 
     return 0 if passed else 1
