@@ -63,14 +63,25 @@ async def get_positions(
 
 @router.delete("/positions/{symbol}")
 async def close_position(
-    symbol: str, client: AlpacaClient = Depends(get_alpaca)
+    symbol: str,
+    client_order_id: str = Header(
+        min_length=16,
+        max_length=32,
+        pattern=r"^[A-Za-z0-9._-]+$",
+        alias="Idempotency-Key",
+    ),
+    client: AlpacaClient = Depends(get_alpaca),
 ) -> Dict[str, Any]:
     guard = PreTradeRiskGuard.get_instance()
-    result = await guard.validate_and_close_position(client, symbol)
+    result = await guard.validate_and_close_position(
+        client, symbol, client_order_id
+    )
     if result.get("reconciliation_required") or result.get("trading_halted"):
         raise HTTPException(status_code=503, detail=result)
     if result.get("status") == "rejected":
         raise HTTPException(status_code=409, detail=result)
+    if not result.get("success"):
+        raise HTTPException(status_code=502, detail=result)
     return result
 
 
