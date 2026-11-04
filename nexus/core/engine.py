@@ -229,27 +229,52 @@ class NexusEngine:
         return self.universe_manager.is_valid_symbol(symbol)
 
     async def get_account_state(self) -> Dict[str, Any]:
+        """Return verified broker state; unknown is never replaced by fallback equity."""
         client = await self._get_client()
         try:
             response = await client.get(f"{self.backend_url}/api/alpaca/account")
-            if response.status_code == 200:
-                return cast(Dict[str, Any], response.json())
+            response.raise_for_status()
+            account = cast(Dict[str, Any], response.json())
+            if not isinstance(account, dict) or account.get("enabled") is False:
+                raise RuntimeError("Broker account response is invalid or disabled.")
+            if not account.get("simulated") and account.get("status") != "ACTIVE":
+                raise RuntimeError("Live broker account is not verified ACTIVE.")
+            equity_raw = account.get("equity", account.get("portfolio_value"))
+            last_equity_raw = account.get("last_equity", equity_raw)
+            equity = float(equity_raw)
+            last_equity = float(last_equity_raw)
+            if (
+                not np.isfinite(equity)
+                or equity <= 0
+                or not np.isfinite(last_equity)
+                or last_equity <= 0
+            ):
+                raise RuntimeError("Broker account returned invalid equity.")
+            return account
         except Exception as exc:
-            logger.warning(f"Account fetch failure: {exc}")
-        return {
-            "equity": self.portfolio_value,
-            "last_equity": self.portfolio_value,
-        }
+            logger.error("Account fetch failed; broker state is unknown: %s", exc)
+            raise RuntimeError("Cannot verify broker account state; trading cycle aborted.") from exc
 
     async def get_positions(self) -> List[Dict[str, Any]]:
+        """Return broker-reconciled positions; an HTTP failure is not an empty portfolio."""
         client = await self._get_client()
         try:
             response = await client.get(f"{self.backend_url}/api/alpaca/positions")
-            if response.status_code == 200:
-                return cast(List[Dict[str, Any]], response.json().get("positions", []))
+            response.raise_for_status()
+            payload = cast(Dict[str, Any], response.json())
+            positions = payload.get("positions")
+            if not isinstance(positions, list):
+                raise RuntimeError("Broker positions response is missing a positions list.")
+            for position in positions:
+                if not isinstance(position, dict) or not position.get("symbol"):
+                    raise RuntimeError("Broker returned malformed position data.")
+                quantity = float(position.get("qty", float("nan")))
+                if not np.isfinite(quantity):
+                    raise RuntimeError("Broker returned non-finite position quantity.")
+            return cast(List[Dict[str, Any]], positions)
         except Exception as exc:
-            logger.warning(f"Position fetch failure: {exc}")
-        return []
+            logger.error("Position fetch failed; refusing to assume an empty portfolio: %s", exc)
+            raise RuntimeError("Cannot reconcile broker positions; trading cycle aborted.") from exc
 
     async def fetch_universe_history(
         self, symbols: List[str], timeframe: str = "1D", limit: int = 80
@@ -277,11 +302,20 @@ class NexusEngine:
     def build_portfolio_state(
         self, account: Dict[str, Any], positions: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
-        total_value = float(account.get("equity", self.portfolio_value))
-        last_equity = float(account.get("last_equity", total_value))
-        if np.isnan(total_value) or total_value <= 0:
-            total_value = self.portfolio_value
-        drawdown = max(0.0, (last_equity - total_value) / max(total_value, 1.0))
+        equity_raw = account.get("equity", account.get("portfolio_value"))
+        last_equity_raw = account.get("last_equity", equity_raw)
+        if equity_raw is None or last_equity_raw is None:
+            raise ValueError("Cannot build portfolio state without broker equity.")
+        total_value = float(equity_raw)
+        last_equity = float(last_equity_raw)
+        if (
+            not np.isfinite(total_value)
+            or total_value <= 0
+            or not np.isfinite(last_equity)
+            or last_equity <= 0
+        ):
+            raise ValueError("Cannot build portfolio state from invalid equity.")
+        drawdown = max(0.0, (last_equity - total_value) / last_equity)
         return {
             "total_value": total_value,
             "drawdown": drawdown,
@@ -330,16 +364,27 @@ class NexusEngine:
         await self._verify_order_fills()
 
         client = await self._get_client()
+        clock_verified = False
+        clock_data: Dict[str, Any] = {"is_open": False}
         try:
             response = await client.get(f"{self.backend_url}/api/alpaca/clock")
-            clock_data = (
-                response.json() if response.status_code == 200 else {"is_open": False}
-            )
-        except Exception:
-            clock_data = {"is_open": False}
+            response.raise_for_status()
+            clock_payload = response.json()
+            clock_data = clock_payload.get("clock", clock_payload)
+            if not isinstance(clock_data, dict) or not isinstance(clock_data.get("is_open"), bool):
+                raise RuntimeError("Broker clock response is malformed.")
+            clock_verified = True
+        except Exception as exc:
+            logger.error("Broker market clock is unavailable; new entries will be blocked: %s", exc)
 
-        account = await self.get_account_state()
-        current_positions = await self.get_positions()
+        try:
+            account = await self.get_account_state()
+            current_positions = await self.get_positions()
+        except Exception as exc:
+            logger.critical("Trading cycle aborted because broker account/positions are unknown: %s", exc)
+            self.health_monitor.record("broker", False, details="Account/position state unknown")
+            self.health_monitor.heartbeat()
+            return
         holdings = {p["symbol"]: p for p in current_positions}
 
         for symbol in list(self.position_ages):
@@ -379,31 +424,50 @@ class NexusEngine:
 
         await self.manage_positions(current_positions, history)
 
+        # Keep the engine conservative while any prior broker order is still
+        # open or cannot be reconciled. Pending quantity is not in holdings yet.
+        if self._active_orders:
+            logger.warning(
+                "New entries blocked while %d broker order(s) remain unresolved.",
+                len(self._active_orders),
+            )
+            return
+
+        if not clock_verified:
+            logger.error("New entries blocked because market-hours state is unknown.")
+            return
+
         benchmark_data = await self.alpha_engine.fetch_market_data(
             "SPY", timeframe="1D", limit=120
         )
 
-        if not benchmark_data.empty:
-            try:
-                self.market_regime = self.regime_detector.detect(benchmark_data)
-                regime_probs = self.regime_detector.get_regime_probabilities()
-            except Exception as e:
-                logger.warning(f"Regime detection failed: {e}")
-                self.market_regime = "SIDEWAYS"
-                regime_probs = {
-                    "BULL": 0.25,
-                    "BEAR": 0.25,
-                    "SIDEWAYS": 0.25,
-                    "TURBULENT": 0.25,
-                }
-        else:
-            self.market_regime = "SIDEWAYS"
-            regime_probs = {
-                "BULL": 0.25,
-                "BEAR": 0.25,
-                "SIDEWAYS": 0.25,
-                "TURBULENT": 0.25,
-            }
+        if benchmark_data.empty or "close" not in benchmark_data.columns:
+            logger.error("SPY benchmark data is unavailable; no new risk-increasing orders.")
+            self.health_monitor.record("market", False, details="Benchmark data unavailable")
+            self.health_monitor.heartbeat()
+            return
+
+        benchmark_close = pd.to_numeric(benchmark_data["close"], errors="coerce")
+        benchmark_returns = benchmark_close.pct_change(fill_method=None)
+        benchmark_returns = benchmark_returns.replace([np.inf, -np.inf], np.nan).dropna()
+        returns_list = benchmark_returns.to_numpy(dtype=float)
+        if returns_list.size < 20 or not np.isfinite(returns_list).all():
+            logger.error(
+                "SPY risk sample is insufficient or invalid (%d returns); new orders blocked.",
+                returns_list.size,
+            )
+            self.health_monitor.record("risk", False, details="Invalid benchmark return sample")
+            self.health_monitor.heartbeat()
+            return
+
+        try:
+            self.market_regime = self.regime_detector.detect(benchmark_data)
+            regime_probs = self.regime_detector.get_regime_probabilities()
+        except Exception as exc:
+            logger.error("Regime detection failed; new entries blocked: %s", exc)
+            self.health_monitor.record("risk", False, details="Regime detection failed")
+            self.health_monitor.heartbeat()
+            return
 
         # ── AI Ensemble Brain Conviction Layer ───────────────────────────────
         enhanced_signals: Dict[str, float] = {}
@@ -440,21 +504,24 @@ class NexusEngine:
             historical_data=history,
         )
 
-        returns_list = (
-            benchmark_data["close"].pct_change().dropna().to_numpy()
-            if not benchmark_data.empty
-            else np.array([])
-        )
-        risk_metrics = {
-            "var": 0.0,
-            "cvar": 0.0,
-            "volatility": 0.0,
-            "sharpe": 0.0,
-        }
-        if returns_list.size > 0:
-            rust_risk = PolyglotBridge.calculate_risk_rust(returns_list.tolist())
-            risk_metrics = self.risk_engine.assess_risk(returns_list)
-            risk_metrics["rust_var"] = float(rust_risk.get("var", 0.0))
+        risk_metrics = self.risk_engine.assess_risk(returns_list)
+        rust_risk = PolyglotBridge.calculate_risk_rust(returns_list.tolist())
+        if rust_risk.get("status") == "OK":
+            rust_var = rust_risk.get("var")
+            rust_es = rust_risk.get("expected_shortfall")
+            if (
+                isinstance(rust_var, (int, float))
+                and isinstance(rust_es, (int, float))
+                and np.isfinite(rust_var)
+                and np.isfinite(rust_es)
+            ):
+                risk_metrics["rust_var"] = float(rust_var)
+                risk_metrics["rust_expected_shortfall"] = float(rust_es)
+        else:
+            logger.warning(
+                "Rust risk metrics unavailable (%s); Python risk engine remains authoritative.",
+                rust_risk.get("status", "UNKNOWN"),
+            )
 
         multiplier = self.determine_risk_scale(
             {"regime_probabilities": regime_probs}, risk_metrics
