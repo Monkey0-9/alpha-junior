@@ -95,7 +95,9 @@ async def test_order_submit_timeout_persists_halt_and_does_not_disable_reads(
     session.post.return_value = BrokenPost()
     client._get_session.return_value = session
 
-    result = await client.submit_order("AAPL", 1, "buy")
+    result = await client.submit_order(
+        "AAPL", 1, "buy", client_order_id="test-timeout-order-0001"
+    )
     assert result["status"] == "SUBMISSION_UNKNOWN"
     assert result["reconciliation_required"] is True
     assert result["trading_halted"] is True
@@ -103,7 +105,9 @@ async def test_order_submit_timeout_persists_halt_and_does_not_disable_reads(
     assert client.trading_halted is True
     assert ExecutionHaltState.is_halted() is True
 
-    blocked = await client.submit_order("AAPL", 1, "buy")
+    blocked = await client.submit_order(
+        "AAPL", 1, "buy", client_order_id="test-timeout-order-0001"
+    )
     assert blocked["status"] == "EXECUTION_HALTED"
 
 
