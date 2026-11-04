@@ -37,12 +37,12 @@ The implementation branch addresses a number of these issues and adds tests and 
 - Alpaca 401 no longer silently switches to simulation.
 - Failed live position/order reads raise explicit reconciliation errors rather than returning an empty portfolio.
 - Order submission, cancel, and close timeouts are represented as unknown outcomes.
-- A persistent execution circuit breaker is written atomically to `data/execution_halt.json`; malformed state is treated as halted.
-- An operator-only reset command requires an operator identity, reconciliation reference, and explicit broker-reconciled confirmation.
+- A persistent execution circuit breaker is written atomically to `data/execution_halt.json`; malformed state is treated as halted. A durable SQLite `order_intents` table reserves idempotency keys before dispatch and preserves approved, submitted, partial, terminal and unresolved states. Startup reconciles those intents against broker order history.
+- Operator tools reconcile a specific intent with an operator identity and broker reference. The global halt reset checks that no unresolved local intents remain, requires explicit broker-reconciled/no-open-orders assertions, and requires API/engine restart after clearing.
 - Core engine order-status lookup no longer treats HTTP 404 or unknown states as proof that an order is terminal.
 - Core order dispatch is routed through the guarded API; direct duplicate governance/trade persistence in the scheduler is removed.
 - The pre-trade guard refreshes account and positions, checks equity consistency, and requires a fresh timestamped live market mark.
-- Position closes use a guarded and audited route.
+- Position closes require an idempotency header, use a guarded/audited durable intent, and are tracked in broker-order reconciliation.
 
 ### Audit and risk
 - SQLite is root-relative and configured with WAL, full synchronous mode, and a busy timeout.
