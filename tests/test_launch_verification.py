@@ -23,6 +23,7 @@ async def test_pre_trade_guard_rejects_unauthenticated_broker() -> None:
         "qty": 10,
         "side": "buy",
         "price": 150.0,
+        "client_order_id": "test-order-disabled-0001",
     }
 
     result = await guard.validate_and_submit(client=client, order_request=order_req)
@@ -57,6 +58,7 @@ async def test_pre_trade_guard_governance_concentration() -> None:
         "qty": 300,
         "side": "buy",
         "price": 100.0,
+        "client_order_id": "test-order-concentration-001",
     }
 
     empty_pos: list[dict[str, object]] = []
