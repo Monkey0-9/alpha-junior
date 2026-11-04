@@ -65,6 +65,7 @@ class NexusEngine:
         self._client: Optional[httpx.AsyncClient] = None
         # Tracking Submitted Orders
         self._active_orders: Dict[str, str] = {}  # symbol -> order_id
+        self._execution_halted = ExecutionHaltState.is_halted()
 
         # Superhuman Brain: drawdown velocity tracker
         self._equity_history: List[float] = []  # recent equity snapshots
@@ -327,6 +328,7 @@ class NexusEngine:
         self, reason: str, *, symbol: Optional[str] = None, order_id: Optional[str] = None
     ) -> None:
         """Persist a circuit breaker after an order lifecycle becomes ambiguous."""
+        self._execution_halted = True
         try:
             ExecutionHaltState.trip(reason, symbol=symbol, order_id=order_id)
         except Exception as exc:
@@ -387,7 +389,7 @@ class NexusEngine:
 
         # Phase 1: Verify fills from previous cycle.
         await self._verify_order_fills()
-        if ExecutionHaltState.is_halted():
+        if self._execution_halted or ExecutionHaltState.is_halted():
             logger.critical(
                 "Execution circuit breaker is active; cycle is read/reconciliation-only."
             )
