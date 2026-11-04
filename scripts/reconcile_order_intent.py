@@ -54,7 +54,15 @@ def main() -> int:
         ],
     )
 
-    if args.status == "FILLED" and not governance.has_trade_record(args.client_order_id):
+    if governance.has_trade_record(args.client_order_id):
+        governance.update_trade_order_status(
+            args.client_order_id,
+            args.status,
+            broker_order_id=args.broker_order_id or intent.get("broker_order_id"),
+            qty=float(intent["qty"]),
+            price=args.fill_price,
+        )
+    else:
         governance.record_trade({
             "symbol": intent["symbol"],
             "side": intent["side"],
@@ -62,7 +70,7 @@ def main() -> int:
             "price": args.fill_price,
             "order_type": intent["order_type"],
             "strategy": intent.get("strategy"),
-            "status": "FILLED",
+            "status": args.status,
             "order_id": args.broker_order_id or intent.get("broker_order_id"),
             "client_order_id": args.client_order_id,
             "intent_id": args.client_order_id,
