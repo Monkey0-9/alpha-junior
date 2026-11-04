@@ -9,6 +9,7 @@ Replaces flat normalized weights with:
 """
 
 import logging
+import math
 import numpy as np
 import pandas as pd
 from typing import Dict, Any, List, Optional, Tuple
@@ -45,7 +46,15 @@ class KellyCriterionSizer:
     """
 
     def __init__(self, fraction: float = 0.25):
-        self.fraction = fraction  # conservative fractional Kelly
+        try:
+            parsed_fraction = float(fraction)
+        except (TypeError, ValueError):
+            parsed_fraction = 0.0
+        self.fraction = (
+            float(np.clip(parsed_fraction, 0.0, 1.0))
+            if math.isfinite(parsed_fraction)
+            else 0.0
+        )
 
     def size_position(
         self,
@@ -66,11 +75,15 @@ class KellyCriterionSizer:
         -------
         float   Kelly fraction of capital to allocate (0–1, clipped)
         """
+        values = (win_rate, avg_win, avg_loss)
+        if not all(math.isfinite(float(value)) for value in values):
+            return 0.0
         if avg_loss <= 0 or avg_win <= 0:
-            return 0.02  # minimum allocation
+            # Missing/invalid payoff information cannot justify allocating capital.
+            return 0.0
 
         b = avg_win / avg_loss  # win/loss ratio
-        p = max(0.01, min(0.99, win_rate))
+        p = max(0.0, min(1.0, win_rate))
         q = 1.0 - p
 
         kelly_f = (p * b - q) / b
@@ -161,10 +174,18 @@ class PortfolioOptimizer:
         -------
         dict[symbol → weight]   Portfolio weights (sum ≤ 1.0)
         """
-        if not symbols:
+        if not symbols or len(symbols) != len(signals):
+            return {}
+        if (
+            any(not isinstance(symbol, str) or not symbol.strip() for symbol in symbols)
+            or len(set(symbols)) != len(symbols)
+        ):
             return {}
 
-        signals_arr = np.array(signals, dtype=float)
+        signals_arr = np.asarray(signals, dtype=float)
+        if signals_arr.ndim != 1 or not np.isfinite(signals_arr).all():
+            return {}
+        signals_arr = np.clip(signals_arr, -1.0, 1.0)
 
         # Step 1: IC scaling — amplify high-IC signals, dampen low-IC
         ic_scales = np.array(
@@ -207,7 +228,11 @@ class PortfolioOptimizer:
           2. No asset below self.MIN_POSITION is allocated.
           3. Total allocated weight sum <= 1.0 (remainder is cash buffer).
         """
-        eligible = {k: float(v) for k, v in raw_weights.items() if v >= 1e-6}
+        eligible = {
+            k: float(v)
+            for k, v in raw_weights.items()
+            if isinstance(v, (int, float)) and math.isfinite(float(v)) and v >= 1e-6
+        }
         if not eligible:
             return {}
 
