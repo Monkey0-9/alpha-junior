@@ -10,14 +10,18 @@ logger = logging.getLogger(__name__)
 
 
 # Default DB path — data/ directory in project root
-_DB_DIR = Path("data")
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_DB_DIR = _PROJECT_ROOT / "data"
 _DB_PATH = _DB_DIR / "nexus_audit.db"
 
 
 def _get_db() -> sqlite3.Connection:
     """Open or create the audit database."""
     _DB_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(_DB_PATH))
+    conn = sqlite3.connect(str(_DB_PATH), timeout=5.0)
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=FULL")
     conn.execute("""CREATE TABLE IF NOT EXISTS audit_log (
             id        INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT    NOT NULL,
@@ -170,9 +174,7 @@ class GovernanceEngine:
             "status": status,
             "details": details or "Compliance Passed",
         }
-        self.audit_log.append(entry)
-
-        # Persist to SQLite
+        # Persist first. An order must never be approved on an in-memory-only audit.
         try:
             self._db.execute(
                 "INSERT INTO audit_log "
@@ -190,7 +192,14 @@ class GovernanceEngine:
             )
             self._db.commit()
         except sqlite3.Error as exc:
-            logger.warning(f"Audit DB write failed: {exc}")
+            try:
+                self._db.rollback()
+            except sqlite3.Error:
+                pass
+            logger.critical("Audit DB write failed; approval is unavailable: %s", exc)
+            raise RuntimeError("Unable to durably persist governance audit.") from exc
+
+        self.audit_log.append(entry)
 
         msg = (
             f"AUDIT: {status} - {request['side']} "
@@ -219,4 +228,9 @@ class GovernanceEngine:
             )
             self._db.commit()
         except sqlite3.Error as exc:
-            logger.warning(f"Trade history write failed: {exc}")
+            try:
+                self._db.rollback()
+            except sqlite3.Error:
+                pass
+            logger.critical("Trade history persistence failed: %s", exc)
+            raise RuntimeError("Unable to durably persist trade lineage.") from exc
