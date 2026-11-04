@@ -882,11 +882,16 @@ class NexusEngine:
             )
 
     async def _close_position(self, symbol: str) -> None:
-        """Use the guarded API close route and preserve ambiguous close state."""
+        """Use the guarded idempotent API close route and track its broker order."""
         client = await self._get_client()
+        client_order_id = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"alpha-junior:{self._cycle_id}:{symbol}:close",
+        ).hex[:32]
         try:
             response = await client.delete(
-                f"{self.backend_url}/api/alpaca/positions/{symbol}"
+                f"{self.backend_url}/api/alpaca/positions/{symbol}",
+                headers={"Idempotency-Key": client_order_id},
             )
             payload: Dict[str, Any] = {}
             try:
@@ -896,6 +901,15 @@ class NexusEngine:
             except Exception:
                 pass
             if response.status_code == 200:
+                broker_order_id = payload.get("order_id") or payload.get("id")
+                if not broker_order_id:
+                    self._trip_execution_halt(
+                        "Close API returned success without broker order ID.",
+                        symbol=symbol,
+                    )
+                    return
+                self._active_orders[symbol] = str(broker_order_id)
+                self._active_client_order_ids[symbol] = client_order_id
                 self.position_manager.reset_watermark(symbol)
                 return
             detail = payload.get("detail", payload)
@@ -905,6 +919,7 @@ class NexusEngine:
                 self._trip_execution_halt(
                     "Close-position API returned an ambiguous outcome.",
                     symbol=symbol,
+                    order_id=client_order_id,
                 )
             else:
                 logger.error(
@@ -917,6 +932,7 @@ class NexusEngine:
             self._trip_execution_halt(
                 f"Position close transport outcome is unknown: {exc}",
                 symbol=symbol,
+                order_id=client_order_id,
             )
 
     async def manage_positions(
