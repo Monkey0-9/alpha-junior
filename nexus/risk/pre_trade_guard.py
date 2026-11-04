@@ -560,18 +560,24 @@ class PreTradeRiskGuard:
         }
 
     async def validate_and_close_position(
-        self, client: AlpacaClient, symbol: str
+        self,
+        client: AlpacaClient,
+        symbol: str,
+        client_order_id: str,
     ) -> Dict[str, Any]:
-        """Audit and close an existing position through the same controlled boundary."""
+        """Reserve, audit and submit a position close using the common intent ledger."""
         if ExecutionHaltState.is_halted() or getattr(client, "trading_halted", False):
             return self._reject(
-                "Execution circuit breaker is active; reconcile broker state before dispatching position changes.",
+                "Execution circuit breaker is active; reconcile broker state before close requests.",
                 reconciliation_required=True,
                 trading_halted=True,
             )
         symbol = symbol.strip().upper()
         if not _SYMBOL_RE.fullmatch(symbol):
             return self._reject("Invalid position symbol.")
+        if not isinstance(client_order_id, str) or not _CLIENT_ORDER_ID_RE.fullmatch(client_order_id):
+            return self._reject("A caller-supplied client_order_id of 16–32 safe characters is required.")
+
         try:
             state = await self._verified_state(client)
         except Exception as exc:
@@ -594,54 +600,150 @@ class PreTradeRiskGuard:
         signed_qty = float(position["qty_signed"])
         qty = abs(signed_qty)
         side = "buy" if signed_qty < 0 else "sell"
+        mark = position.get("current_price")
         try:
-            self.governance._log_audit(
-                {
-                    "symbol": symbol,
-                    "qty": qty,
-                    "side": side,
-                    "price": float(position.get("current_price", 0.0) or 0.0),
-                },
-                "CLOSE_REQUESTED",
-            )
+            if mark is None or float(mark) <= 0 or not math.isfinite(float(mark)):
+                raise ValueError("Position has no valid mark price.")
+            close_request = {
+                "symbol": symbol,
+                "qty": qty,
+                "side": side,
+                "price": float(mark),
+                "order_type": "market",
+                "strategy": "position_close",
+                "asset_class": "equity",
+                "time_in_force": "day",
+                "client_order_id": client_order_id,
+                "intent_id": client_order_id,
+            }
+            # Log and reserve before DELETE reaches the broker.
+            self.governance._log_audit(close_request, "CLOSE_REQUESTED")
+            reserved = self.governance.prepare_order_intent(close_request)
+            if not reserved.get("_created"):
+                self._trip_halt(
+                    client,
+                    "Close idempotency key already exists; close must not be repeated.",
+                    symbol=symbol,
+                    order_id=reserved.get("broker_order_id") or client_order_id,
+                )
+                return self._reject(
+                    "Close intent already exists; reconcile before retry.",
+                    reconciliation_required=True,
+                    trading_halted=True,
+                )
         except Exception as exc:
-            logger.critical("Close request audit failed; not dispatching: %s", exc)
-            client.enabled = False
+            logger.critical("Close intent could not be durably recorded; not dispatching: %s", exc)
+            self._trip_halt(
+                client,
+                "Close audit or intent persistence failed before broker dispatch.",
+                symbol=symbol,
+                order_id=client_order_id,
+            )
             return self._reject(
-                "Close audit persistence failed; request not dispatched and execution halted.",
+                "Close audit/intent persistence failed; request not dispatched and execution halted.",
                 trading_halted=True,
+                reconciliation_required=True,
             )
 
-        result = await client.close_position(symbol)
+        result = await client.close_position(symbol, client_order_id=client_order_id)
         if not result.get("success"):
+            status = str(result.get("status", "")).upper()
+            try:
+                self.governance.update_order_intent(
+                    client_order_id,
+                    "RECONCILIATION_REQUIRED" if result.get("reconciliation_required") else "REJECTED",
+                    error=result.get("error"),
+                )
+            except Exception as exc:
+                logger.critical("Could not persist close outcome: %s", exc)
             if result.get("reconciliation_required") or result.get("trading_halted"):
+                self._trip_halt(
+                    client,
+                    "Position close outcome is unresolved.",
+                    symbol=symbol,
+                    order_id=client_order_id,
+                )
                 return result
             return self._reject(
                 result.get("error", "Broker did not confirm position close."),
-                broker_status=result.get("status"),
+                broker_status=status,
             )
 
+        broker_order_id = result.get("order_id") or result.get("id")
+        if not broker_order_id:
+            self._trip_halt(
+                client,
+                "Broker accepted position close but did not return an order ID.",
+                symbol=symbol,
+                order_id=client_order_id,
+            )
+            try:
+                self.governance.update_order_intent(
+                    client_order_id,
+                    "RECONCILIATION_REQUIRED",
+                    error="Close response omitted broker order ID.",
+                )
+            except Exception:
+                pass
+            return {
+                "success": False,
+                "status": "CLOSE_OUTCOME_UNKNOWN",
+                "symbol": symbol,
+                "client_order_id": client_order_id,
+                "error": "Close may have been accepted but broker order ID is missing; reconcile before retry.",
+                "reconciliation_required": True,
+                "trading_halted": True,
+            }
+
         try:
+            self.governance.update_order_intent(
+                client_order_id,
+                "SUBMITTED",
+                broker_order_id=str(broker_order_id),
+            )
             self.governance.record_trade(
                 {
                     "symbol": symbol,
                     "side": side,
                     "qty": qty,
-                    "price": position.get("current_price"),
+                    "price": float(mark),
                     "order_type": "market",
                     "strategy": "position_close",
                     "status": result.get("status", "CLOSE_REQUEST_ACCEPTED"),
+                    "order_id": str(broker_order_id),
+                    "client_order_id": client_order_id,
+                    "intent_id": client_order_id,
                 }
             )
         except Exception as exc:
-            logger.critical("Close may have been accepted but audit persistence failed: %s", exc)
-            client.enabled = False
+            logger.critical("Close accepted but intent/history persistence failed: %s", exc)
+            self._trip_halt(
+                client,
+                "Broker may have accepted a position close but durable lineage is incomplete.",
+                symbol=symbol,
+                order_id=str(broker_order_id),
+            )
+            try:
+                self.governance.update_order_intent(
+                    client_order_id,
+                    "RECONCILIATION_REQUIRED",
+                    broker_order_id=str(broker_order_id),
+                    error=str(exc),
+                )
+            except Exception:
+                pass
             return {
                 "success": True,
                 "status": "CLOSE_SUBMITTED_AUDIT_FAILURE",
                 "symbol": symbol,
-                "error": "Position close may be active at the broker; audit persistence failed. Reconcile before retry.",
+                "order_id": str(broker_order_id),
+                "client_order_id": client_order_id,
+                "error": "Close may be active at broker; durable lineage is incomplete. Reconcile before retry.",
                 "reconciliation_required": True,
                 "trading_halted": True,
             }
-        return result
+        return {
+            **result,
+            "order_id": str(broker_order_id),
+            "client_order_id": client_order_id,
+        }
