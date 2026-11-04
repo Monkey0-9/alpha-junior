@@ -9,6 +9,7 @@ from typing import List, Dict, Any, Optional, cast
 from nexus.audit.governance import GovernanceEngine
 from nexus.core.alpha import AlphaEngine
 from nexus.execution.execution_ai import ExecutionAgent
+from nexus.execution.halt_state import ExecutionHaltState
 from nexus.monitoring.health import HealthMonitor
 from nexus.models.zoo.ensemble import AIEnsembleBrain
 from nexus.risk.engine import RiskEngine
@@ -322,46 +323,79 @@ class NexusEngine:
             "positions": positions,
         }
 
+    def _trip_execution_halt(
+        self, reason: str, *, symbol: Optional[str] = None, order_id: Optional[str] = None
+    ) -> None:
+        """Persist a circuit breaker after an order lifecycle becomes ambiguous."""
+        try:
+            ExecutionHaltState.trip(reason, symbol=symbol, order_id=order_id)
+        except Exception as exc:
+            logger.critical("Unable to persist execution halt; process must remain stopped: %s", exc)
+        self.health_monitor.record(
+            "execution", False, details=f"TRADING HALTED: {reason}"
+        )
+        self.health_monitor.heartbeat()
+
     async def _verify_order_fills(self) -> None:
-        """Check status of active orders and clear them once filled/cancelled."""
+        """Resolve order lifecycle states; unknown/404 outcomes trip persistent halt."""
         if not self._active_orders:
             return
 
         client = await self._get_client()
-        to_remove = []
+        terminal_statuses = {"filled", "canceled", "cancelled", "expired", "rejected"}
         for symbol, order_id in list(self._active_orders.items()):
             try:
                 response = await client.get(
                     f"{self.backend_url}/api/alpaca/orders/{order_id}"
                 )
-                if response.status_code == 200:
-                    order_info = response.json()
-                    status = order_info.get("status") or order_info.get("order_status")
-                    if status in {"filled", "canceled", "expired", "rejected"}:
-                        logger.info(
-                            f"Order {order_id} for {symbol} finalized: {status}"
-                        )
-                        to_remove.append(symbol)
-                elif response.status_code == 404:
-                    logger.warning(f"Order {order_id} not found on backend.")
-                    to_remove.append(symbol)
+                if response.status_code != 200:
+                    self._trip_execution_halt(
+                        f"Unable to reconcile order (HTTP {response.status_code}).",
+                        symbol=symbol,
+                        order_id=order_id,
+                    )
+                    continue
+
+                order_info = response.json()
+                status = str(
+                    order_info.get("status") or order_info.get("order_status") or ""
+                ).lower()
+                if status in terminal_statuses:
+                    logger.info("Order %s for %s finalized: %s", order_id, symbol, status)
+                    self._active_orders.pop(symbol, None)
                 else:
-                    logger.debug(
-                        f"Order {order_id} for {symbol} status check returned {response.status_code}."
+                    # Open, partially filled, missing, or unfamiliar statuses all
+                    # remain tracked and prevent new orders until terminal/reconciled.
+                    logger.warning(
+                        "Order %s for %s is unresolved (status=%s). New entries remain blocked.",
+                        order_id,
+                        symbol,
+                        status or "UNKNOWN",
                     )
             except Exception as exc:
-                logger.debug(f"Error verifying order {order_id}: {exc}")
-
-        for s in to_remove:
-            self._active_orders.pop(s, None)
+                logger.error("Error reconciling order %s for %s: %s", order_id, symbol, exc)
+                self._trip_execution_halt(
+                    "Order lifecycle reconciliation failed.",
+                    symbol=symbol,
+                    order_id=order_id,
+                )
 
     async def run_cycle(self) -> None:
         logger.info("Starting new trading cycle.")
         if time.time() - self.last_universe_refresh > Config.UNIVERSE_RESCAN_INTERVAL:
             await self.refresh_universe()
 
-        # Phase 1: Verify fills from previous cycle
+        # Phase 1: Verify fills from previous cycle.
         await self._verify_order_fills()
+        if ExecutionHaltState.is_halted():
+            logger.critical(
+                "Execution circuit breaker is active; cycle is read/reconciliation-only."
+            )
+            self.health_monitor.record(
+                "execution", False, details="Persistent execution halt active"
+            )
+            self.health_monitor.heartbeat()
+            return
 
         client = await self._get_client()
         clock_verified = False
@@ -628,51 +662,53 @@ class NexusEngine:
         selected_strategy: str,
         is_open: bool,
     ) -> None:
-        if abs(weight) < 0.0001 or symbol not in history or history[symbol].empty:
+        """Generate a target delta; the API's PreTradeRiskGuard is the only order authority."""
+        if (
+            ExecutionHaltState.is_halted()
+            or symbol in self._active_orders
+            or abs(weight) < 0.0001
+            or symbol not in history
+            or history[symbol].empty
+        ):
             return
-        current_price = float(history[symbol]["close"].iloc[-1])
 
-        total_value = portfolio_state.get("total_value", self.portfolio_value)
-        target_qty = int((total_value * abs(weight)) / max(current_price, 1.0))
+        try:
+            current_price = float(history[symbol]["close"].iloc[-1])
+            total_value = float(portfolio_state["total_value"])
+            if (
+                not np.isfinite(current_price)
+                or current_price <= 0
+                or not np.isfinite(total_value)
+                or total_value <= 0
+            ):
+                raise ValueError("Target sizing inputs are invalid.")
+        except Exception as exc:
+            logger.error("Unable to size target for %s: %s", symbol, exc)
+            return
+
+        target_qty = int((total_value * abs(weight)) / current_price)
         qty_diff = target_qty - abs(current_qty)
-
-        if abs(qty_diff) < 1 or (abs(qty_diff) * current_price < 100):
+        if abs(qty_diff) < 1 or abs(qty_diff) * current_price < Config.MIN_ORDER_USD:
             return
 
         side = "buy" if qty_diff > 0 else "sell"
         qty = abs(qty_diff)
-        order_type, limit_price = ("market", None)
-
+        order_type = "market"
+        limit_price = None
         if not is_open:
-            order_type, limit_price = (
-                "limit",
-                current_price * (1.002 if side == "buy" else 0.998),
-            )
+            # Limit price is an execution constraint only; the pre-trade guard
+            # independently obtains a verified live mark for risk valuation.
+            order_type = "limit"
+            limit_price = current_price * (1.002 if side == "buy" else 0.998)
 
-        trade_request = {
-            "symbol": symbol,
-            "qty": qty,
-            "side": side,
-            "price": current_price,
-            "order_type": order_type,
-            "strategy": selected_strategy,
-        }
-        if not PolyglotBridge.validate_order_zig(trade_request).get("valid"):
-            return
-        approved, _ = self.governance.check_compliance(
-            trade_request, portfolio_state, current_qty=current_qty
-        )
-        if not approved:
-            return
-
-        payload = {
+        payload: Dict[str, Any] = {
             "symbol": symbol,
             "qty": qty,
             "side": side,
             "order_type": order_type,
             "strategy": selected_strategy,
         }
-        if limit_price:
+        if limit_price is not None:
             payload["limit_price"] = round(limit_price, 4)
         if not is_open:
             payload["extended_hours"] = True
@@ -680,43 +716,99 @@ class NexusEngine:
         client = await self._get_client()
         try:
             response = await client.post(
-                f"{self.backend_url}/api/alpaca/order", json=payload
+                f"{self.backend_url}/api/alpaca/order",
+                json=payload,
             )
+            response_payload: Dict[str, Any] = {}
+            try:
+                parsed = response.json()
+                if isinstance(parsed, dict):
+                    response_payload = parsed
+            except Exception:
+                pass
+
             if response.status_code in {200, 201}:
-                order_data = response.json()
-                order_id = order_data.get("id") or order_data.get("order_id")
-                if order_id:
-                    self._active_orders[symbol] = order_id
-                    logger.info(f"Order submitted for {symbol}: {order_id}")
-                    self.governance.record_trade(
-                        {
-                            "symbol": symbol,
-                            "side": side,
-                            "qty": qty,
-                            "price": current_price,
-                            "order_type": order_type,
-                            "strategy": selected_strategy,
-                            "status": order_data.get("status", "PENDING"),
-                        }
+                order_id = response_payload.get("id") or response_payload.get("order_id")
+                status = str(response_payload.get("status", "")).lower()
+                if not order_id:
+                    self._trip_execution_halt(
+                        "Order endpoint returned success without a broker order identifier.",
+                        symbol=symbol,
                     )
-                else:
-                    logger.warning(
-                        f"Order response missing id for {symbol}: {order_data}"
-                    )
+                    return
+                self._active_orders[symbol] = str(order_id)
+                logger.info(
+                    "Order submitted for %s: id=%s status=%s",
+                    symbol,
+                    order_id,
+                    status or "unknown",
+                )
+                return
+
+            detail = response_payload.get("detail", response_payload)
+            if isinstance(detail, dict) and (
+                detail.get("reconciliation_required") or detail.get("trading_halted")
+            ):
+                self._trip_execution_halt(
+                    "Order API reported an ambiguous broker outcome.",
+                    symbol=symbol,
+                    order_id=detail.get("order_id"),
+                )
+            elif response.status_code >= 500:
+                self._trip_execution_halt(
+                    f"Order API failed with HTTP {response.status_code}; broker outcome is not certified.",
+                    symbol=symbol,
+                )
             else:
                 logger.error(
-                    f"Order submission failed for {symbol}: HTTP {response.status_code} {response.text}"
+                    "Order submission rejected for %s: HTTP %s %s",
+                    symbol,
+                    response.status_code,
+                    detail,
                 )
         except Exception as exc:
-            logger.error(f"Order submission error for {symbol}: {exc}")
+            self._trip_execution_halt(
+                f"Order request transport outcome is unknown: {exc}",
+                symbol=symbol,
+            )
 
     async def _close_position(self, symbol: str) -> None:
+        """Use the guarded API close route and preserve ambiguous close state."""
         client = await self._get_client()
         try:
-            await client.delete(f"{self.backend_url}/api/alpaca/positions/{symbol}")
-            self.position_manager.reset_watermark(symbol)
+            response = await client.delete(
+                f"{self.backend_url}/api/alpaca/positions/{symbol}"
+            )
+            payload: Dict[str, Any] = {}
+            try:
+                parsed = response.json()
+                if isinstance(parsed, dict):
+                    payload = parsed
+            except Exception:
+                pass
+            if response.status_code == 200:
+                self.position_manager.reset_watermark(symbol)
+                return
+            detail = payload.get("detail", payload)
+            if isinstance(detail, dict) and (
+                detail.get("reconciliation_required") or detail.get("trading_halted")
+            ):
+                self._trip_execution_halt(
+                    "Close-position API returned an ambiguous outcome.",
+                    symbol=symbol,
+                )
+            else:
+                logger.error(
+                    "Position close rejected for %s: HTTP %s %s",
+                    symbol,
+                    response.status_code,
+                    detail,
+                )
         except Exception as exc:
-            logger.error(f"Error closing position for {symbol}: {exc}")
+            self._trip_execution_halt(
+                f"Position close transport outcome is unknown: {exc}",
+                symbol=symbol,
+            )
 
     async def manage_positions(
         self,
@@ -750,10 +842,7 @@ class NexusEngine:
                 )
 
                 if should_close:
-                    await client.delete(
-                        f"{self.backend_url}/api/alpaca/positions/{symbol}"
-                    )
-                    self.position_manager.reset_watermark(symbol)
+                    await self._close_position(symbol)
             except Exception as exc:
                 logger.warning(f"Failed to evaluate close for {symbol}: {exc}")
 
