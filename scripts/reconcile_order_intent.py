@@ -35,27 +35,9 @@ def main() -> int:
             parser.error("--fill-price must be positive for FILLED reconciliation.")
         if not args.broker_order_id and not intent.get("broker_order_id"):
             parser.error("A broker order ID is required for FILLED reconciliation.")
-        if not governance.has_trade_record(args.client_order_id):
-            governance.record_trade({
-                "symbol": intent["symbol"],
-                "side": intent["side"],
-                "qty": intent["qty"],
-                "price": args.fill_price,
-                "order_type": intent["order_type"],
-                "strategy": intent.get("strategy"),
-                "status": "FILLED",
-                "order_id": args.broker_order_id or intent.get("broker_order_id"),
-                "client_order_id": args.client_order_id,
-                "intent_id": args.client_order_id,
-            })
 
-    updated = governance.update_order_intent(
-        args.client_order_id,
-        args.status,
-        broker_order_id=args.broker_order_id,
-        operator=args.operator,
-        reconciliation_reference=args.reconciliation_reference,
-    )
+    # Record the operator assertion before changing the terminal state. If audit
+    # persistence fails, the order intent remains unresolved and the halt stays.
     governance._log_audit(
         {
             "symbol": intent["symbol"],
@@ -70,6 +52,28 @@ def main() -> int:
             f"status={args.status}",
             f"client_order_id={args.client_order_id}",
         ],
+    )
+
+    if args.status == "FILLED" and not governance.has_trade_record(args.client_order_id):
+        governance.record_trade({
+            "symbol": intent["symbol"],
+            "side": intent["side"],
+            "qty": intent["qty"],
+            "price": args.fill_price,
+            "order_type": intent["order_type"],
+            "strategy": intent.get("strategy"),
+            "status": "FILLED",
+            "order_id": args.broker_order_id or intent.get("broker_order_id"),
+            "client_order_id": args.client_order_id,
+            "intent_id": args.client_order_id,
+        })
+
+    updated = governance.update_order_intent(
+        args.client_order_id,
+        args.status,
+        broker_order_id=args.broker_order_id,
+        operator=args.operator,
+        reconciliation_reference=args.reconciliation_reference,
     )
     print(json.dumps(updated, indent=2))
     return 0
