@@ -15,6 +15,7 @@ from nexus.utils.polyglot_bridge import PolyglotBridge
 
 logger = logging.getLogger(__name__)
 _SYMBOL_RE = re.compile(r"^[A-Z][A-Z0-9.-]{0,15}$")
+_CLIENT_ORDER_ID_RE = re.compile(r"^[A-Za-z0-9._-]{16,32}$")
 _ORDER_TYPES = {"market", "limit", "stop", "stop_limit", "trailing_stop"}
 
 
@@ -178,6 +179,15 @@ class PreTradeRiskGuard:
         if side not in {"buy", "sell"}:
             return self._reject("Order side must be buy or sell.")
 
+        client_order_id = order_request.get("client_order_id")
+        if (
+            not isinstance(client_order_id, str)
+            or not _CLIENT_ORDER_ID_RE.fullmatch(client_order_id)
+        ):
+            return self._reject(
+                "A caller-supplied client_order_id of 16–32 safe characters is required for idempotency."
+            )
+
         try:
             qty = self._finite_positive(order_request.get("qty"), "Order quantity")
         except ValueError as exc:
@@ -259,6 +269,8 @@ class PreTradeRiskGuard:
             "trail_price": prices.get("trail_price"),
             "trail_percent": prices.get("trail_percent"),
             "strategy": order_request.get("strategy", "manual"),
+            "client_order_id": client_order_id,
+            "intent_id": client_order_id,
         }
 
         validation = PolyglotBridge.validate_order_zig(trade_compliance_req)
@@ -317,6 +329,9 @@ class PreTradeRiskGuard:
                         "order_type": order_type,
                         "strategy": order_request.get("strategy", "manual"),
                         "status": result.get("status", "SUBMITTED"),
+                        "order_id": result.get("order_id") or result.get("id"),
+                        "client_order_id": client_order_id,
+                        "intent_id": client_order_id,
                     }
                 )
             except Exception as exc:
