@@ -35,6 +35,8 @@ class ProductionVerifier:
         modules = [
             "nexus.utils.config",
             "nexus.execution.alpaca",
+            "nexus.execution.halt_state",
+            "nexus.research.ncm",
             "nexus.core.engine",
             "nexus.core.alpha",
             "nexus.audit.governance",
@@ -237,12 +239,14 @@ class ProductionVerifier:
             return False
 
     async def test_pre_trade_guard(self) -> bool:
-        """Exercise a non-dispatching rejection path at the pre-trade boundary."""
+        """Verify malformed orders and concentration breaches never dispatch."""
         logger.info("\\n" + "=" * 60)
         logger.info("6. TESTING PRE-TRADE RISK GUARD")
         logger.info("=" * 60)
 
         try:
+            from datetime import datetime, timezone
+            from unittest.mock import AsyncMock
             from nexus.risk.pre_trade_guard import PreTradeRiskGuard
             from nexus.execution.alpaca import AlpacaClient, AlpacaCredentials
 
@@ -251,28 +255,68 @@ class ProductionVerifier:
                 credentials=AlpacaCredentials("TEST_KEY", "TEST_SECRET")
             )
             client.enabled = False
-            result = await guard.validate_and_submit(
-                client,
-                {"symbol": "AAPL", "qty": 10, "side": "buy"},
+            rejected_disabled = await guard.validate_and_submit(
+                client=client,
+                order_request={
+                    "symbol": "AAPL",
+                    "qty": 10,
+                    "side": "buy",
+                    "client_order_id": "verify-disabled-0001",
+                },
             )
-            if result.get("status") != "rejected":
+            if rejected_disabled.get("status") != "rejected":
                 logger.error("  [FAIL] Disabled broker was not rejected.")
                 self.results["pre_trade_guard"] = False
                 return False
 
-            # Invalid requests must be rejected before any broker state reads.
             client.enabled = True
-            invalid = await guard.validate_and_submit(
-                client,
-                {"symbol": "AAPL", "qty": float("nan"), "side": "buy"},
+            client.simulated = False
+            client.get_account = AsyncMock(return_value={
+                "enabled": True,
+                "simulated": False,
+                "status": "ACTIVE",
+                "equity": 10000.0,
+                "last_equity": 10000.0,
+            })
+            client.get_positions = AsyncMock(return_value=[])
+            client.get_bars = AsyncMock(return_value=[{
+                "t": datetime.now(timezone.utc).isoformat(),
+                "close": 100.0,
+            }])
+            client.submit_order = AsyncMock(return_value={
+                "success": True,
+                "order_id": "should-not-submit",
+            })
+
+            portfolio = {
+                "total_value": 10000.0,
+                "drawdown": 0.0,
+                "positions": [],
+            }
+            oversized = await guard.validate_and_submit(
+                client=client,
+                order_request={
+                    "symbol": "AAPL",
+                    "qty": 100,
+                    "side": "buy",
+                    "client_order_id": "verify-oversized-0001",
+                },
+                portfolio_state=portfolio,
             )
-            if invalid.get("status") != "rejected":
-                logger.error("  [FAIL] Non-finite quantity passed validation.")
+            if (
+                oversized.get("status") != "rejected"
+                or not any(
+                    "POSITION_CONCENTRATION" in violation
+                    for violation in oversized.get("violations", [])
+                )
+            ):
+                logger.error("  [FAIL] Oversized concentration order was not rejected.")
                 self.results["pre_trade_guard"] = False
                 return False
+            client.submit_order.assert_not_awaited()
 
             self.results["pre_trade_guard"] = True
-            logger.info("  [OK] Disabled broker and non-finite order rejection verified.")
+            logger.info("  [OK] Disabled broker and concentration checks reject without dispatch.")
             return True
         except Exception as exc:
             logger.error("  [FAIL] Pre-trade guard verification error: %s", exc)
