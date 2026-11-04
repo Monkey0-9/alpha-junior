@@ -48,7 +48,11 @@ def main() -> int:
         operator=args.operator,
         reconciliation_reference=args.reconciliation_reference,
     )
-    print(json.dumps({"cleared": True, "state": result}, indent=2))
+    print(json.dumps({
+        "cleared": True,
+        "state": result,
+        "next_step": "Restart the API and trading-engine processes. Their in-memory halt flags intentionally remain set until restart.",
+    }, indent=2))
     return 0
 
 
