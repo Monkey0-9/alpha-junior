@@ -145,6 +145,100 @@ class _AsyncResponse:
         return False
 
 
+def test_durable_order_intent_reservation_is_idempotent_and_detects_conflict(tmp_path, monkeypatch):
+    monkeypatch.setattr("nexus.audit.governance._DB_DIR", tmp_path)
+    monkeypatch.setattr("nexus.audit.governance._DB_PATH", tmp_path / "audit.db")
+    from nexus.audit.governance import GovernanceEngine
+
+    governance = GovernanceEngine()
+    request = {
+        "symbol": "AAPL",
+        "qty": 2.0,
+        "side": "buy",
+        "order_type": "market",
+        "limit_price": None,
+        "stop_price": None,
+        "trail_price": None,
+        "trail_percent": None,
+        "strategy": "unit-test",
+        "asset_class": "equity",
+        "time_in_force": "day",
+        "client_order_id": "intent-test-order-0001",
+    }
+
+    first = governance.prepare_order_intent(request)
+    replay = governance.prepare_order_intent(request)
+    assert first["_created"] is True
+    assert replay["_created"] is False
+    assert first["client_order_id"] == replay["client_order_id"]
+    assert len(governance.list_unresolved_order_intents()) == 1
+
+    conflicting = {**request, "qty": 3.0}
+    with pytest.raises(RuntimeError, match="different order intent"):
+        governance.prepare_order_intent(conflicting)
+
+    governance.update_order_intent(
+        request["client_order_id"],
+        "SUBMITTED",
+        broker_order_id="broker-test-123",
+    )
+    assert len(governance.list_unresolved_order_intents()) == 1
+    governance.record_trade({
+        "symbol": "AAPL",
+        "side": "buy",
+        "qty": 2.0,
+        "price": 100.0,
+        "order_type": "market",
+        "strategy": "unit-test",
+        "status": "SUBMITTED",
+        "order_id": "broker-test-123",
+        "client_order_id": "intent-test-order-0001",
+        "intent_id": "intent-test-order-0001",
+    })
+    assert governance.list_unresolved_order_intents() == []
+
+
+@pytest.mark.asyncio
+async def test_pretrade_guard_does_not_redispatch_an_existing_approved_intent(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("nexus.audit.governance._DB_DIR", tmp_path)
+    monkeypatch.setattr("nexus.audit.governance._DB_PATH", tmp_path / "audit.db")
+    from nexus.audit.governance import GovernanceEngine
+    from nexus.risk.pre_trade_guard import PreTradeRiskGuard
+
+    governance = GovernanceEngine()
+    order = {
+        "symbol": "AAPL",
+        "qty": 1.0,
+        "side": "buy",
+        "order_type": "market",
+        "limit_price": None,
+        "stop_price": None,
+        "trail_price": None,
+        "trail_percent": None,
+        "strategy": "manual",
+        "asset_class": "equity",
+        "time_in_force": "day",
+        "client_order_id": "intent-replay-test-0001",
+    }
+    governance.prepare_order_intent(order)
+
+    client = MagicMock()
+    client.enabled = True
+    client.simulated = False
+    client.trading_halted = False
+    client.submit_order = AsyncMock(return_value={"success": True, "order_id": "must-not-submit"})
+
+    guard = PreTradeRiskGuard(governance=governance)
+    result = await guard.validate_and_submit(client, order)
+
+    assert result["status"] == "rejected"
+    assert result["reconciliation_required"] is True
+    client.submit_order.assert_not_awaited()
+    assert ExecutionHaltState.is_halted() is True
+
+
 def test_polyglot_validator_rejects_nonfinite_and_missing_side(monkeypatch):
     monkeypatch.delenv("NEXUS_STRICT_POLYGLOT", raising=False)
     valid_base = {"symbol": "AAPL", "qty": 1, "price": 100, "side": "buy"}
