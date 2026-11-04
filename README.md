@@ -7,7 +7,7 @@ Alpha-Junior (Nexus) combines market-data ingestion, research signals, model exp
 ## Current engineering status
 
 - **Broker integration:** Alpaca client and API routes exist. Live broker lifecycle, partial fills, timeouts, restarts, and reconciliation require sandbox integration and fault-injection sign-off.
-- **Execution safety:** a mandatory pre-trade boundary and persistent execution-halt mechanism are under development. The halt must be manually cleared only after external broker reconciliation.
+- **Execution safety:** a mandatory pre-trade boundary and persistent execution-halt mechanism are under development. The halt is persisted across restarts; an unresolved order-intent ledger or broker order blocks new entries. Manual clearing requires intent reconciliation and then a restart of the API and engine processes.
 - **Research models:** technical/factor signals and tree/neural model wrappers exist. Untrained inference returns HOLD; automatic retraining and promotion are disabled by default.
 - **NCM:** a declared-graph Neural Causal Model research prototype exists under `nexus/research/ncm/`. It is offline/advisory-only and is not connected to executable trades.
 - **Native components:** C++ extensions are built by CI on Linux, Windows and macOS. Rust/Go/Zig components still require separate build, parity and operational validation for each supported target.
@@ -105,10 +105,11 @@ Ambiguous order submit/cancel/close outcomes must stop risk-increasing execution
 python scripts/clear_execution_halt.py \
   --operator "operator-id" \
   --reconciliation-reference "broker-export-or-incident-reference" \
-  --confirm-broker-reconciled
+  --confirm-broker-reconciled \\
+  --confirm-no-unresolved-intents
 ```
 
-This command records an operator assertion and reference; it does not itself contact a broker or prove reconciliation. Keep the execution service stopped while reconciling.
+This command checks that the local order-intent ledger has no unresolved rows and records the operator assertion/reference; it does not itself contact a broker or prove reconciliation. Reconcile broker open orders, fills and positions externally, stop the API/engine, clear the halt, then restart both processes.
 
 ## License and deployment notice
 
