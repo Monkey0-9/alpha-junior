@@ -434,7 +434,7 @@ class GovernanceEngine:
             "SELECT i.client_order_id FROM order_intents i "
             "LEFT JOIN trade_history t ON t.client_order_id = i.client_order_id "
             "WHERE i.status IN ('APPROVED', 'SUBMISSION_UNKNOWN', 'RECONCILIATION_REQUIRED', 'PARTIALLY_FILLED') "
-            "OR (i.status = 'SUBMITTED' AND t.id IS NULL) "
+            "OR (i.status IN ('SUBMITTED', 'FILLED') AND t.id IS NULL) "
             "ORDER BY i.created_at"
         ).fetchall()
         return [
