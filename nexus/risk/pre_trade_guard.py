@@ -200,14 +200,16 @@ class PreTradeRiskGuard:
 
         try:
             state = await self._verified_state(client, portfolio_state)
-            mark = (
-                await self._verified_live_mark(client, symbol)
-                if not client.simulated
-                else self._finite_positive(
-                    order_request.get("price") or prices.get("limit_price") or prices.get("stop_price"),
+            if client.simulated:
+                simulation_bars = await client.get_bars(symbol, timeframe="1Min", limit=1)
+                if not simulation_bars:
+                    raise RuntimeError("Simulation market mark is unavailable.")
+                mark = self._finite_positive(
+                    simulation_bars[-1].get("close", simulation_bars[-1].get("c")),
                     "Simulation market mark",
                 )
-            )
+            else:
+                mark = await self._verified_live_mark(client, symbol)
         except Exception as exc:
             logger.error("Pre-trade state verification failed for %s: %s", symbol, exc)
             return self._reject(
@@ -221,10 +223,16 @@ class PreTradeRiskGuard:
                 signed_current_qty = float(position["qty_signed"])
                 break
 
-        if not client.simulated and abs(float(current_qty)) > 0:
-            # The supplied quantity is only a consistency check. A material
-            # difference means the engine's snapshot is stale.
-            if abs(abs(float(current_qty)) - abs(signed_current_qty)) > 1e-6:
+        if not client.simulated:
+            try:
+                supplied_qty = float(current_qty)
+            except (TypeError, ValueError):
+                return self._reject("Caller position quantity is invalid.")
+            if not math.isfinite(supplied_qty):
+                return self._reject("Caller position quantity is non-finite.")
+            # A supplied zero is not an authoritative assertion; compare only
+            # when the caller actually supplies a non-zero holding.
+            if abs(supplied_qty) > 1e-9 and abs(abs(supplied_qty) - abs(signed_current_qty)) > 1e-6:
                 return self._reject(
                     "Caller position quantity differs from current broker holdings; refresh and retry.",
                     reconciliation_required=True,
