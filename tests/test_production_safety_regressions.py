@@ -204,6 +204,9 @@ async def test_pretrade_guard_does_not_redispatch_an_existing_approved_intent(
 ):
     monkeypatch.setattr("nexus.audit.governance._DB_DIR", tmp_path)
     monkeypatch.setattr("nexus.audit.governance._DB_PATH", tmp_path / "audit.db")
+    monkeypatch.setattr(
+        "nexus.execution.halt_state._STATE_PATH", tmp_path / "execution_halt.json"
+    )
     from nexus.audit.governance import GovernanceEngine
     from nexus.risk.pre_trade_guard import PreTradeRiskGuard
 
@@ -229,6 +232,9 @@ async def test_pretrade_guard_does_not_redispatch_an_existing_approved_intent(
     client.simulated = False
     client.trading_halted = False
     client.submit_order = AsyncMock(return_value={"success": True, "order_id": "must-not-submit"})
+    client._trip_execution_halt = MagicMock(
+        side_effect=lambda reason, **kwargs: ExecutionHaltState.trip(reason, **kwargs)
+    )
 
     guard = PreTradeRiskGuard(governance=governance)
     result = await guard.validate_and_submit(client, order)
