@@ -181,66 +181,136 @@ class NexusEngine:
             logger.error("Unable to reach execution backend.")
             return False
 
-        # Recover unresolved application intents and broker working orders before
-        # any scheduler cycle can create a new entry.
+        # Recover durable app intents and broker order history before the scheduler
+        # can create a new entry. Query all recent orders so a fill/cancel that
+        # completed while the process was down can be matched to its client ID.
         try:
             unresolved_intents = self.governance.list_unresolved_order_intents()
-            for intent in unresolved_intents:
-                self._trip_execution_halt(
-                    f"Unresolved durable order intent on startup (status={intent.get('status')}).",
-                    symbol=intent.get("symbol"),
-                    order_id=intent.get("broker_order_id") or intent.get("client_order_id"),
-                )
-                if intent.get("broker_order_id") and intent.get("symbol"):
-                    symbol = str(intent["symbol"]).upper()
-                    self._active_orders[symbol] = str(intent["broker_order_id"])
-                    self._active_client_order_ids[symbol] = str(intent["client_order_id"])
+            unresolved_by_client_id = {
+                str(intent["client_order_id"]): intent
+                for intent in unresolved_intents
+                if intent.get("client_order_id")
+            }
         except Exception as exc:
-            logger.critical(
-                "Unable to read durable order-intent ledger; engine remains halted: %s",
-                exc,
-            )
+            logger.critical("Unable to read durable order-intent ledger: %s", exc)
             self._trip_execution_halt("Order-intent ledger unavailable on startup.")
             return False
 
         try:
             orders_response = await client.get(
                 f"{self.backend_url}/api/alpaca/orders",
-                params={"status": "open", "limit": 500},
+                params={"status": "all", "limit": 500},
             )
             orders_response.raise_for_status()
             orders_payload = orders_response.json()
-            open_orders = orders_payload.get("orders")
-            if not isinstance(open_orders, list):
-                raise RuntimeError("Broker open-orders response is malformed.")
+            broker_orders = orders_payload.get("orders")
+            if not isinstance(broker_orders, list):
+                raise RuntimeError("Broker order-history response is malformed.")
 
-            for order in open_orders:
+            terminal_statuses = {
+                "filled": "FILLED",
+                "canceled": "CANCELLED",
+                "cancelled": "CANCELLED",
+                "expired": "EXPIRED",
+                "rejected": "REJECTED",
+            }
+            matched_intents: set[str] = set()
+
+            for order in broker_orders:
                 if not isinstance(order, dict):
-                    raise RuntimeError("Broker returned malformed open-order record.")
+                    raise RuntimeError("Broker returned malformed order-history record.")
                 order_id = order.get("id") or order.get("order_id")
                 symbol = order.get("symbol")
                 status = str(order.get("status", "")).lower()
-                if status in {"filled", "canceled", "cancelled", "expired", "rejected"}:
-                    continue
-                if not order_id or not symbol:
-                    raise RuntimeError("Open order lacks broker order ID or symbol.")
-                normalized_symbol = str(symbol).upper()
-                self._active_orders[normalized_symbol] = str(order_id)
                 client_order_id = order.get("client_order_id")
-                if client_order_id:
-                    self._active_client_order_ids[normalized_symbol] = str(client_order_id)
-                self._trip_execution_halt(
-                    f"Broker working order found on startup (status={status or 'UNKNOWN'}).",
-                    symbol=normalized_symbol,
-                    order_id=str(order_id),
+                intent = (
+                    unresolved_by_client_id.get(str(client_order_id))
+                    if client_order_id
+                    else None
                 )
+
+                if intent and client_order_id:
+                    matched_intents.add(str(client_order_id))
+                    if not order_id or not symbol:
+                        raise RuntimeError("Matched broker order omitted ID or symbol.")
+                    mapped_status = terminal_statuses.get(status)
+                    if mapped_status:
+                        self.governance.update_order_intent(
+                            str(client_order_id),
+                            mapped_status,
+                            broker_order_id=str(order_id),
+                        )
+                        if not self.governance.has_trade_record(str(client_order_id)):
+                            filled_price = order.get("filled_avg_price")
+                            self.governance.record_trade({
+                                "symbol": str(symbol).upper(),
+                                "side": str(order.get("side", intent["side"])).lower(),
+                                "qty": float(order.get("filled_qty") or order.get("qty") or intent["qty"]),
+                                "price": float(filled_price) if filled_price is not None else None,
+                                "order_type": str(order.get("type") or intent["order_type"]),
+                                "strategy": intent.get("strategy"),
+                                "status": mapped_status,
+                                "order_id": str(order_id),
+                                "client_order_id": str(client_order_id),
+                                "intent_id": str(client_order_id),
+                            })
+                    else:
+                        self.governance.update_order_intent(
+                            str(client_order_id),
+                            "PARTIALLY_FILLED" if status in {"partially_filled", "partial_fill"} else "SUBMITTED",
+                            broker_order_id=str(order_id),
+                        )
+                        normalized_symbol = str(symbol).upper()
+                        self._active_orders[normalized_symbol] = str(order_id)
+                        self._active_client_order_ids[normalized_symbol] = str(client_order_id)
+                        self._trip_execution_halt(
+                            f"Unresolved broker order recovered on startup (status={status or 'UNKNOWN'}).",
+                            symbol=normalized_symbol,
+                            order_id=str(order_id),
+                        )
+                    continue
+
+                # Even a broker order with an unknown/local-less client ID blocks
+                # trading. It may have been entered manually or by another worker.
+                if status not in terminal_statuses:
+                    if not order_id or not symbol:
+                        raise RuntimeError("Open broker order lacks ID or symbol.")
+                    normalized_symbol = str(symbol).upper()
+                    self._active_orders[normalized_symbol] = str(order_id)
+                    if client_order_id:
+                        self._active_client_order_ids[normalized_symbol] = str(client_order_id)
+                    self._trip_execution_halt(
+                        "Unmatched broker working order found on startup.",
+                        symbol=normalized_symbol,
+                        order_id=str(order_id),
+                    )
+
+            # An APPROVED / UNKNOWN intent with no matching order cannot be
+            # assumed rejected; retain its halt for manual reconciliation.
+            for client_order_id, intent in unresolved_by_client_id.items():
+                if client_order_id not in matched_intents:
+                    self._trip_execution_halt(
+                        "Durable order intent has no matching order in recent broker history; acceptance remains unproven.",
+                        symbol=intent.get("symbol"),
+                        order_id=client_order_id,
+                    )
+
+            # Re-read unresolved state after broker reconciliation. Any remaining
+            # entry blocks scheduling even if the persistent halt file is absent.
+            remaining = self.governance.list_unresolved_order_intents()
+            if remaining:
+                logger.critical(
+                    "%d unresolved order intent(s) remain after startup reconciliation.",
+                    len(remaining),
+                )
+                self._trip_execution_halt("Unresolved order intents remain after startup reconciliation.")
         except Exception as exc:
             logger.critical(
                 "Startup broker order reconciliation failed; engine cannot enable entries: %s",
                 exc,
             )
             self.health_monitor.record(
-                "broker", False, details="Startup open-order reconciliation failed"
+                "broker", False, details="Startup order reconciliation failed"
             )
             self.health_monitor.heartbeat()
             return False
