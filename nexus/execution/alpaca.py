@@ -743,25 +743,121 @@ class AlpacaClient:
             if self._bars_inflight.get(cache_key) is task:
                 self._bars_inflight.pop(cache_key, None)
 
-    async def close_position(self, symbol: str) -> Dict[str, Any]:
+    async def close_position(
+        self, symbol: str, client_order_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Request a position close; ambiguous outcomes always require reconciliation."""
         symbol = symbol.upper()
+        if self.trading_halted or ExecutionHaltState.is_halted():
+            return {
+                "success": False,
+                "status": "EXECUTION_HALTED",
+                "error": "Execution is halted pending broker reconciliation.",
+                "reconciliation_required": True,
+                "trading_halted": True,
+            }
+
         if self.simulated:
             bars = await self.get_bars(symbol, timeframe="1Min", limit=1)
-            current_price = float(bars[-1]["close"]) if bars else 100.0
+            if not bars:
+                return {
+                    "success": False,
+                    "status": "CLOSE_REJECTED",
+                    "error": "No simulated market mark is available; close rejected.",
+                }
+            try:
+                current_price = float(bars[-1].get("close", bars[-1].get("c", 0.0)))
+            except (TypeError, ValueError):
+                current_price = 0.0
+            if not np.isfinite(current_price) or current_price <= 0:
+                return {
+                    "success": False,
+                    "status": "CLOSE_REJECTED",
+                    "error": "Simulated market mark is invalid; close rejected.",
+                }
             result = self.simulator.close_position(symbol, current_price)
-            return {**result, "success": True, "simulated": True}
+            synthetic_id = client_order_id or f"sim-close-{symbol}"
+            return {
+                **result,
+                "success": bool(result.get("success", True)),
+                "symbol": symbol,
+                "id": synthetic_id,
+                "order_id": synthetic_id,
+                "client_order_id": client_order_id,
+                "status": result.get("status", "CLOSE_REQUEST_ACCEPTED"),
+                "simulated": True,
+            }
 
         try:
             session = await self._get_session()
             async with session.delete(
                 f"{self.base_url}/v2/positions/{symbol}", headers=self.headers
             ) as response:
-                if response.status in {200, 201, 204}:
-                    return {"success": True, "symbol": symbol, "status": "CLOSE_REQUEST_ACCEPTED"}
+                if response.status in {200, 201}:
+                    try:
+                        data = await response.json()
+                    except Exception:
+                        data = {}
+                    broker_order_id = data.get("id") if isinstance(data, dict) else None
+                    if not broker_order_id:
+                        self._trip_execution_halt(
+                            "Broker accepted position close but omitted its order ID.",
+                            symbol=symbol,
+                            order_id=client_order_id,
+                        )
+                        return {
+                            "success": False,
+                            "status": "CLOSE_OUTCOME_UNKNOWN",
+                            "error": "Broker close response omitted order ID; reconcile broker state.",
+                            "reconciliation_required": True,
+                            "trading_halted": True,
+                        }
+                    return {
+                        "success": True,
+                        "symbol": symbol,
+                        "id": broker_order_id,
+                        "order_id": broker_order_id,
+                        "client_order_id": client_order_id,
+                        "status": data.get("status", "CLOSE_REQUEST_ACCEPTED"),
+                    }
+
+                if response.status == 204:
+                    self._trip_execution_halt(
+                        "Broker returned 204 for position close without an order identifier.",
+                        symbol=symbol,
+                        order_id=client_order_id,
+                    )
+                    return {
+                        "success": False,
+                        "status": "CLOSE_OUTCOME_UNKNOWN",
+                        "error": "Close request may have been accepted but broker returned no order ID; reconcile before retry.",
+                        "reconciliation_required": True,
+                        "trading_halted": True,
+                    }
+
                 if response.status == 401:
                     self.enabled = False
                     self.simulated = False
-                    return {"success": False, "status": "UNAUTHORIZED", "error": "Broker credentials rejected."}
+                    return {
+                        "success": False,
+                        "status": "UNAUTHORIZED",
+                        "error": "Broker credentials rejected.",
+                    }
+
+                if response.status == 404:
+                    self._trip_execution_halt(
+                        "Broker returned 404 for close; current position state must be reconciled.",
+                        symbol=symbol,
+                        order_id=client_order_id,
+                    )
+                    return {
+                        "success": False,
+                        "status": "CLOSE_OUTCOME_UNKNOWN",
+                        "error": "Broker position was not found; reconcile positions and orders before retry.",
+                        "reconciliation_required": True,
+                        "trading_halted": True,
+                    }
+
                 return {
                     "success": False,
                     "status": "CLOSE_REJECTED",
@@ -772,6 +868,7 @@ class AlpacaClient:
             self._trip_execution_halt(
                 "Position close timed out; broker close state is unknown.",
                 symbol=symbol,
+                order_id=client_order_id,
             )
             return {
                 "success": False,
