@@ -22,6 +22,17 @@ class Config:
         os.getenv("NEXUS_MAX_MARKET_DATA_AGE_SECONDS", "180")
     )
 
+    # Retraining and promotion are separated and disabled by default. Enabling
+    # them requires a reviewed offline evaluation/artifact pipeline.
+    AUTO_RETRAIN_ENABLED = (
+        os.getenv("NEXUS_AUTO_RETRAIN_ENABLED", "false").strip().lower()
+        in {"true", "1", "yes"}
+    )
+    AUTO_MODEL_PROMOTION_ENABLED = (
+        os.getenv("NEXUS_AUTO_MODEL_PROMOTION", "false").strip().lower()
+        in {"true", "1", "yes"}
+    )
+
     UNIVERSE_RESCAN_INTERVAL = int(os.getenv("NEXUS_RESCAN_INTERVAL", "14400"))
 
     API_HOST = os.getenv("NEXUS_API_HOST", "127.0.0.1")
