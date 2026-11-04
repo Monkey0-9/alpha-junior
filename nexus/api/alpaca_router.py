@@ -39,7 +39,19 @@ async def get_alpaca() -> AlpacaClient:
 
 
 def _order_result_or_raise(result: Dict[str, Any]) -> Dict[str, Any]:
-    return _order_result_or_raise(result)
+    if result.get("reconciliation_required") or result.get("trading_halted"):
+        raise HTTPException(status_code=503, detail=result)
+    if result.get("status") == "rejected":
+        raise HTTPException(
+            status_code=403,
+            detail=result.get("error", "Order rejected by pre-trade risk guard."),
+        )
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=502,
+            detail=result.get("error", "Broker did not confirm order submission."),
+        )
+    return result
 
 
 @router.get("/account")
@@ -190,14 +202,7 @@ async def sell_stock(
         client,
         {"symbol": symbol, "qty": qty, "side": "sell", "client_order_id": client_order_id},
     )
-    if result.get("reconciliation_required") or result.get("trading_halted"):
-        raise HTTPException(status_code=503, detail=result)
-    if result.get("status") == "rejected":
-        raise HTTPException(
-            status_code=403,
-            detail=result.get("error", "Order rejected by pre-trade risk guard."),
-        )
-    return result
+    return _order_result_or_raise(result)
 
 
 @router.get("/bars")
