@@ -464,6 +464,40 @@ class AlpacaClient:
             logger.error("Unable to reconcile broker orders: %s", exc)
             raise RuntimeError("Broker order state is unknown; trading must halt.") from exc
 
+    async def get_order(self, order_id: str) -> Dict[str, Any]:
+        """Fetch a specific broker order; never infer state from a short recent-order list."""
+        if self.simulated:
+            for order in reversed(self.simulator.order_history):
+                if str(order.get("id") or order.get("order_id")) == str(order_id):
+                    return dict(order)
+            raise LookupError(f"Simulated order {order_id} was not found.")
+
+        try:
+            session = await self._get_session()
+            async with session.get(
+                f"{self.base_url}/v2/orders/{order_id}",
+                headers=self.headers,
+            ) as response:
+                if response.status in {200, 201}:
+                    payload = await response.json()
+                    if not isinstance(payload, dict):
+                        raise RuntimeError("Broker returned malformed order data.")
+                    return cast(Dict[str, Any], payload)
+                if response.status == 404:
+                    raise LookupError(f"Broker order {order_id} was not found.")
+                if response.status == 401:
+                    self.enabled = False
+                    self.simulated = False
+                    raise PermissionError("Broker credentials rejected while fetching order.")
+                raise RuntimeError(
+                    f"Unable to fetch broker order {order_id} (HTTP {response.status})."
+                )
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logger.error("Unable to reconcile broker order %s: %s", order_id, exc)
+            raise RuntimeError(
+                f"Broker order {order_id} state is unknown; trading must halt."
+            ) from exc
+
     async def cancel_order(self, order_id: str) -> Dict[str, Any]:
         if self.simulated:
             return {"success": True, "order_id": order_id, "simulated": True}
